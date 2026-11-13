@@ -18,8 +18,11 @@ type Matrix struct {
 	DeviceID    string `yaml:"device_id"`
 	Password    string `yaml:"password"`
 	RoomID      string `yaml:"room_id"`
-	PickleKey   string `yaml:"pickle_key"`
-	DisplayName string `yaml:"display_name"`
+	// RoomVia lists servers already in the room, used to join it (optional; needed only if
+	// automatic detection from the invite fails).
+	RoomVia     []string `yaml:"room_via"`
+	PickleKey   string   `yaml:"pickle_key"`
+	DisplayName string   `yaml:"display_name"`
 }
 
 type Summary struct {
@@ -134,8 +137,11 @@ func (c *Config) validate() error {
 	if m.AccessToken != "" && m.DeviceID == "" {
 		add("matrix.device_id is required when using matrix.access_token (E2EE needs a stable device)")
 	}
+	m.RoomID = strings.TrimSpace(m.RoomID)
 	if !strings.HasPrefix(m.RoomID, "!") {
-		add("matrix.room_id must be a room ID like !abc:example.org")
+		add("matrix.room_id must be a room ID like !abc:example.org (quote it in YAML: \"!abc:example.org\")")
+	} else if !validRoomID(m.RoomID) {
+		add("matrix.room_id %q contains invalid or invisible characters; copy it again", m.RoomID)
 	}
 	if m.PickleKey == "" {
 		add("matrix.pickle_key is required")
@@ -219,6 +225,19 @@ func (c *Config) ForgeFor(host string) (Forge, bool) {
 		}
 	}
 	return Forge{}, false
+}
+
+// validRoomID checks a room ID only contains printable ASCII (no spaces or invisible characters).
+func validRoomID(s string) bool {
+	if len(s) < 2 {
+		return false
+	}
+	for _, r := range s {
+		if r <= 0x20 || r >= 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 func parseClock(s string) (int, int, bool) {

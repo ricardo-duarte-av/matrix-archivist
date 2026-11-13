@@ -4,6 +4,7 @@ package bot
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -97,13 +98,13 @@ func (b *Bot) Run(ctx context.Context) error {
 	b.log.Info().Stringer("user_id", whoami.UserID).Stringer("device_id", b.client.DeviceID).Msg("Logged in")
 
 	syncer := b.client.Syncer.(*mautrix.DefaultSyncer)
-	syncer.OnSync(b.client.DontProcessOldEvents)
-	syncer.OnEventType(event.StateMember, b.onMember)
+	syncer.OnSync(b.onSyncInvites)
+	// Note: no DontProcessOldEvents. It drops the whole room from the sync in which the bot
+	// joins, so the room state (m.room.create, power levels, encryption) would never reach the
+	// state store. Old messages are filtered by timestamp in onMessage instead.
 	syncer.OnEventType(event.EventMessage, b.onMessage)
 
-	if err := b.join(ctx); err != nil {
-		b.log.Warn().Err(err).Msg("Could not join room yet (invite the bot; it will join automatically)")
-	}
+	b.ensureJoined(ctx)
 	if b.cfg.Matrix.DisplayName != "" {
 		_ = b.client.SetDisplayName(ctx, b.cfg.Matrix.DisplayName)
 	}
@@ -116,28 +117,98 @@ func (b *Bot) Run(ctx context.Context) error {
 	return err
 }
 
-func (b *Bot) onMember(ctx context.Context, evt *event.Event) {
-	if evt.RoomID != b.roomID || evt.GetStateKey() != b.client.UserID.String() {
-		return
-	}
-	if evt.Content.AsMember().Membership == event.MembershipInvite {
-		b.log.Info().Stringer("inviter", evt.Sender).Msg("Invited to room, joining")
-		if err := b.join(ctx, evt.Sender.Homeserver()); err != nil {
-			b.log.Err(err).Msg("Failed to join room")
+// ensureJoined joins the room at startup if the bot isn't in it yet. A pending invite may have
+// been delivered (and failed) in an earlier run, after which the stored sync token skips it, so
+// do one fresh sync to find it and learn which servers are in the room.
+func (b *Bot) ensureJoined(ctx context.Context) {
+	if joined, err := b.client.JoinedRooms(ctx); err == nil {
+		for _, r := range joined.JoinedRooms {
+			if r == b.roomID {
+				b.log.Info().Msg("Already in room")
+				b.refreshState(ctx)
+				return
+			}
 		}
+	}
+	var stripped []*event.Event
+	if resp, err := b.client.FullSyncRequest(ctx, mautrix.ReqSync{Timeout: 0}); err != nil {
+		b.log.Warn().Err(err).Msg("Initial sync for pending invites failed")
+	} else {
+		if inv, ok := resp.Rooms.Invite[b.roomID]; ok {
+			stripped = inv.State.Events
+			b.log.Info().Msg("Found pending invite to room")
+		}
+		for roomID := range resp.Rooms.Invite {
+			if roomID != b.roomID {
+				b.log.Warn().Str("invited_room", fmt.Sprintf("%q", roomID)).Str("configured_room", fmt.Sprintf("%q", b.roomID)).
+					Msg("Pending invite to a room that is not matrix.room_id")
+			}
+		}
+	}
+	if err := b.join(ctx, stripped); err != nil {
+		b.log.Warn().Err(err).Msg("Could not join room yet (invite the bot; it will join automatically)")
 	}
 }
 
-// join joins the configured room. Room v12+ IDs carry no server name, so the homeserver needs
-// explicit "via" servers to join through: the given ones (e.g. the inviter's), the server from
-// the room ID if present, and the bot's own server.
-func (b *Bot) join(ctx context.Context, extraVia ...string) error {
-	via := JoinVia(b.roomID, b.client.UserID, extraVia...)
-	_, err := b.client.JoinRoom(ctx, b.roomID.String(), &mautrix.ReqJoinRoom{Via: via})
-	if err == nil {
-		b.log.Info().Strs("via", via).Msg("Joined room")
+// onSyncInvites joins the configured room when an invite to it arrives.
+func (b *Bot) onSyncInvites(ctx context.Context, resp *mautrix.RespSync, _ string) bool {
+	for roomID, inv := range resp.Rooms.Invite {
+		if roomID != b.roomID {
+			b.log.Warn().
+				Str("invited_room", fmt.Sprintf("%q", roomID)).
+				Str("configured_room", fmt.Sprintf("%q", b.roomID)).
+				Strs("servers", ServersFromInviteState(inv.State.Events, b.client.UserID)).
+				Msg("Invited to a room that is not matrix.room_id; ignoring. If this is the right room, fix room_id in config.yaml")
+		}
 	}
-	return err
+	if inv, ok := resp.Rooms.Invite[b.roomID]; ok {
+		b.log.Info().Msg("Invited to room, joining")
+		go func() {
+			if err := b.join(b.ctx, inv.State.Events); err != nil {
+				b.log.Err(err).Msg("Failed to join room")
+			}
+		}()
+	}
+	return true
+}
+
+// join joins the configured room. Room v12+ IDs carry no server name, so the homeserver needs
+// explicit "via" servers that are already in the room. They are taken from the configured
+// room_via, the invite's stripped state (inviter, room creator, joined members), the room ID's
+// server if present, and the bot's own server.
+func (b *Bot) join(ctx context.Context, inviteState []*event.Event) error {
+	extra := append([]string{}, b.cfg.Matrix.RoomVia...)
+	extra = append(extra, ServersFromInviteState(inviteState, b.client.UserID)...)
+	via := JoinVia(b.roomID, b.client.UserID, extra...)
+	_, err := b.client.JoinRoom(ctx, b.roomID.String(), &mautrix.ReqJoinRoom{Via: via})
+	if err != nil {
+		return fmt.Errorf("join via %v: %w", via, err)
+	}
+	b.log.Info().Strs("via", via).Msg("Joined room")
+	b.refreshState(ctx)
+	return nil
+}
+
+// ServersFromInviteState extracts candidate servers from an invite's stripped state, most
+// useful first: the inviter, the room creator, then servers of joined members and other senders.
+func ServersFromInviteState(evts []*event.Event, self id.UserID) []string {
+	var inviter, creator []string
+	var others []string
+	for _, e := range evts {
+		switch {
+		case e.Type == event.StateMember && e.GetStateKey() == self.String():
+			inviter = append(inviter, e.Sender.Homeserver())
+		case e.Type == event.StateCreate:
+			creator = append(creator, e.Sender.Homeserver())
+		case e.Type == event.StateMember:
+			if m, _ := e.Content.Raw["membership"].(string); m == "join" {
+				others = append(others, id.UserID(e.GetStateKey()).Homeserver())
+			}
+		default:
+			others = append(others, e.Sender.Homeserver())
+		}
+	}
+	return append(append(inviter, creator...), others...)
 }
 
 // JoinVia builds a de-duplicated list of servers to join a room through.
@@ -235,14 +306,45 @@ func (b *Bot) react(evt *event.Event, key string) {
 	_, _ = b.client.SendReaction(b.ctx, b.roomID, evt.ID, key)
 }
 
+// refreshState fetches the full room state into the state store (encryption, power levels,
+// create event), so it is correct even if earlier syncs were missed.
+func (b *Bot) refreshState(ctx context.Context) {
+	if _, err := b.client.State(ctx, b.roomID); err != nil {
+		b.log.Warn().Err(err).Msg("Failed to fetch room state")
+	}
+}
+
+// powerLevel returns the user's power level, fetched fresh from the server. Room creators in
+// room v12+ (create event sender and additional_creators) get math.MaxInt.
 func (b *Bot) powerLevel(ctx context.Context, user id.UserID) int {
-	pl, err := b.client.StateStore.GetPowerLevels(ctx, b.roomID)
-	if err != nil || pl == nil {
-		pl = &event.PowerLevelsEventContent{}
-		if err := b.client.StateEvent(ctx, b.roomID, event.StatePowerLevels, "", pl); err != nil {
-			b.log.Warn().Err(err).Msg("Failed to fetch power levels")
+	state, err := b.client.State(ctx, b.roomID)
+	if err != nil {
+		b.log.Warn().Err(err).Msg("Failed to fetch room state; using cached power levels")
+		pl, err := b.client.StateStore.GetPowerLevels(ctx, b.roomID)
+		if err != nil || pl == nil {
 			return 0
 		}
+		return pl.GetUserLevel(user)
 	}
-	return pl.GetUserLevel(user)
+	return UserLevel(state[event.StatePowerLevels][""], state[event.StateCreate][""], user)
+}
+
+// UserLevel computes a user's power level from the power levels and create events (either
+// may be nil). Creators are unlimited in room v12+; without a power levels event the creator
+// has 100 in older rooms, as per the spec.
+func UserLevel(plEvt, createEvt *event.Event, user id.UserID) int {
+	if plEvt != nil {
+		pl := plEvt.Content.AsPowerLevels()
+		pl.CreateEvent = createEvt
+		return pl.GetUserLevel(user)
+	}
+	if createEvt != nil {
+		if (&event.PowerLevelsEventContent{CreateEvent: createEvt}).GetUserLevel(user) == math.MaxInt {
+			return math.MaxInt
+		}
+		if createEvt.Sender == user {
+			return 100
+		}
+	}
+	return 0
 }

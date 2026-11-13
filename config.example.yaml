@@ -13,6 +13,8 @@ matrix:
 
   # The single room the bot listens and writes to (room ID, not alias). Invite the bot; it auto-joins.
   room_id: "!abcdefghijkl:example.org"
+  # Optional: servers already in the room, used to join it. Normally detected from the invite.
+  # room_via: [example.org]
   # Secret used to encrypt the E2EE keys at rest. Never change it after first start.
   pickle_key: "generate-a-long-random-string"
   display_name: Archivist
