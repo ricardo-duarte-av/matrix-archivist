@@ -101,7 +101,7 @@ func (b *Bot) Run(ctx context.Context) error {
 	syncer.OnEventType(event.StateMember, b.onMember)
 	syncer.OnEventType(event.EventMessage, b.onMessage)
 
-	if _, err := b.client.JoinRoomByID(ctx, b.roomID); err != nil {
+	if err := b.join(ctx); err != nil {
 		b.log.Warn().Err(err).Msg("Could not join room yet (invite the bot; it will join automatically)")
 	}
 	if b.cfg.Matrix.DisplayName != "" {
@@ -122,10 +122,42 @@ func (b *Bot) onMember(ctx context.Context, evt *event.Event) {
 	}
 	if evt.Content.AsMember().Membership == event.MembershipInvite {
 		b.log.Info().Stringer("inviter", evt.Sender).Msg("Invited to room, joining")
-		if _, err := b.client.JoinRoomByID(ctx, b.roomID); err != nil {
+		if err := b.join(ctx, evt.Sender.Homeserver()); err != nil {
 			b.log.Err(err).Msg("Failed to join room")
 		}
 	}
+}
+
+// join joins the configured room. Room v12+ IDs carry no server name, so the homeserver needs
+// explicit "via" servers to join through: the given ones (e.g. the inviter's), the server from
+// the room ID if present, and the bot's own server.
+func (b *Bot) join(ctx context.Context, extraVia ...string) error {
+	via := JoinVia(b.roomID, b.client.UserID, extraVia...)
+	_, err := b.client.JoinRoom(ctx, b.roomID.String(), &mautrix.ReqJoinRoom{Via: via})
+	if err == nil {
+		b.log.Info().Strs("via", via).Msg("Joined room")
+	}
+	return err
+}
+
+// JoinVia builds a de-duplicated list of servers to join a room through.
+func JoinVia(roomID id.RoomID, self id.UserID, extra ...string) []string {
+	var via []string
+	seen := map[string]bool{}
+	add := func(s string) {
+		if s != "" && !seen[s] {
+			seen[s] = true
+			via = append(via, s)
+		}
+	}
+	for _, s := range extra {
+		add(s)
+	}
+	if _, server, ok := strings.Cut(roomID.String(), ":"); ok {
+		add(server)
+	}
+	add(self.Homeserver())
+	return via
 }
 
 func (b *Bot) onMessage(ctx context.Context, evt *event.Event) {

@@ -64,3 +64,14 @@ func TestCryptoStoreOnModernc(t *testing.T) {
 		t.Fatalf("find device: %v", err)
 	}
 }
+
+func TestJoinVia(t *testing.T) {
+	got := JoinVia("!k4D-BOtxgq4GW6J88ktGmlUZnNBcKRRTPXYF9v-tpDg", "@archivist:aguiarvieira.pt", "aguiarvieira.pt", "other.org")
+	if !reflect.DeepEqual(got, []string{"aguiarvieira.pt", "other.org"}) {
+		t.Errorf("v12 room: %v", got)
+	}
+	got = JoinVia("!abc:matrix.org", "@bot:example.org")
+	if !reflect.DeepEqual(got, []string{"matrix.org", "example.org"}) {
+		t.Errorf("legacy room: %v", got)
+	}
+}
