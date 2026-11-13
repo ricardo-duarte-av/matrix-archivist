@@ -1,0 +1,63 @@
+# matrix-archivist configuration. Copy to config.yaml and edit.
+
+matrix:
+  homeserver: https://matrix.example.org
+  user_id: "@archivist:example.org"
+
+  # Authentication — choose ONE:
+  # (a) Password (recommended): the bot logs in and keeps its E2EE device in crypto.db.
+  password: "change-me"
+  # (b) Access token + the device ID it belongs to (needed for end-to-end encryption).
+  access_token: ""
+  device_id: ""
+
+  # The single room the bot listens and writes to (room ID, not alias). Invite the bot; it auto-joins.
+  room_id: "!abcdefghijkl:example.org"
+  # Secret used to encrypt the E2EE keys at rest. Never change it after first start.
+  pickle_key: "generate-a-long-random-string"
+  display_name: Archivist
+
+# Base command. Examples: !archivist, !bot, !cloner
+command_prefix: "!archivist"
+
+# Minimum room power level for add / remove / refresh (0 = everyone, 50 = moderators, 100 = admins).
+# list / status / summary / help are open to everyone in the room.
+min_power_level: 50
+
+storage_dir: /data/repos
+database: /data/archivist.db
+crypto_database: /data/crypto.db
+
+check_interval: 1h        # how often every repo is checked for updates (>= 1m)
+concurrency: 3            # repos checked in parallel
+git_timeout: 30m          # per clone/fetch
+failure_alert_threshold: 3   # post an alert after this many consecutive failures (0 = off)
+# Delete branches/tags locally when they are deleted upstream. false = keep them (safer for an archive).
+prune_deleted: false
+log_level: info           # debug, info, warn, error
+
+summary:
+  enabled: true
+  time: "09:00"           # 24h clock
+  timezone: Europe/Lisbon # IANA name
+  skip_if_empty: false    # don't post when nothing changed
+
+releases:
+  enabled: true
+  download_assets: true
+  max_asset_size: 2GB     # larger assets are skipped (0 = unlimited)
+  include_prereleases: true
+
+# Release APIs. github.com, gitlab.com, codeberg.org and a few other well-known hosts are detected
+# automatically, and unknown hosts are probed for a Gitea/Forgejo or GitLab API.
+# Add entries for tokens (higher rate limits / private repos) or self-hosted forges.
+forges:
+  - host: github.com
+    type: github          # github | gitea (also Forgejo/Codeberg) | gitlab
+    token: ""             # fine-grained PAT with read-only "Contents" access; strongly recommended
+  # - host: git.example.org
+  #   type: gitea
+  #   token: ""
+  # - host: github.mycorp.com
+  #   type: github
+  #   api_url: https://github.mycorp.com/api/v3

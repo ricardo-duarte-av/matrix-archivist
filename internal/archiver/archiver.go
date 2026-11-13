@@ -1,0 +1,436 @@
+// Package archiver keeps local archives of git repositories and their releases up to date.
+package archiver
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/rs/zerolog"
+
+	"github.com/ricardo-duarte-av/matrix-archivist/internal/config"
+	"github.com/ricardo-duarte-av/matrix-archivist/internal/forge"
+	"github.com/ricardo-duarte-av/matrix-archivist/internal/gitops"
+	"github.com/ricardo-duarte-av/matrix-archivist/internal/store"
+)
+
+// Notifier posts a Markdown message to the room.
+type Notifier func(ctx context.Context, markdown string)
+
+type Archiver struct {
+	cfg   *config.Config
+	store *store.Store
+	git   *gitops.Git
+	forge *forge.Client
+	log   zerolog.Logger
+
+	Notify Notifier
+
+	locksMu sync.Mutex
+	locks   map[int64]*sync.Mutex
+
+	cycleRunning atomic.Bool
+}
+
+func New(cfg *config.Config, st *store.Store, log zerolog.Logger) *Archiver {
+	return &Archiver{
+		cfg:    cfg,
+		store:  st,
+		git:    gitops.New(),
+		forge:  forge.NewClient(),
+		log:    log,
+		locks:  map[int64]*sync.Mutex{},
+		Notify: func(context.Context, string) {},
+	}
+}
+
+func (a *Archiver) lock(id int64) *sync.Mutex {
+	a.locksMu.Lock()
+	defer a.locksMu.Unlock()
+	m, ok := a.locks[id]
+	if !ok {
+		m = &sync.Mutex{}
+		a.locks[id] = m
+	}
+	return m
+}
+
+// Paths for a repository's storage.
+func (a *Archiver) RepoDir(r *store.Repo) string {
+	return filepath.Join(a.cfg.StorageDir, filepath.FromSlash(r.RelDir))
+}
+func (a *Archiver) mirrorDir(r *store.Repo) string   { return filepath.Join(a.RepoDir(r), "mirror.git") }
+func (a *Archiver) checkoutDir(r *store.Repo) string { return filepath.Join(a.RepoDir(r), "checkout") }
+func (a *Archiver) releasesDir(r *store.Repo) string { return filepath.Join(a.RepoDir(r), "releases") }
+
+// Result of checking one repository.
+type Result struct {
+	Repo        *store.Repo
+	Cloned      bool // first clone happened in this check
+	Change      gitops.Change
+	NewReleases []string
+	Err         error // git error (fatal for this check)
+	Warnings    []string
+}
+
+func (r Result) Changed() bool { return r.Cloned || !r.Change.Empty() || len(r.NewReleases) > 0 }
+
+// Text is a one-line Markdown description of the result.
+func (r Result) Text() string {
+	if r.Err != nil {
+		return fmt.Sprintf("❌ failed: `%s`", oneLine(r.Err.Error()))
+	}
+	var parts []string
+	if r.Cloned {
+		parts = append(parts, "cloned")
+	} else if !r.Change.Empty() {
+		parts = append(parts, r.Change.Summary())
+	}
+	if n := len(r.NewReleases); n > 0 {
+		parts = append(parts, releasesText(r.NewReleases))
+	}
+	if len(parts) == 0 {
+		parts = append(parts, "up to date")
+	}
+	s := strings.Join(parts, "; ")
+	if len(r.Warnings) > 0 {
+		s += fmt.Sprintf(" (⚠️ %s)", strings.Join(r.Warnings, "; "))
+	}
+	return s
+}
+
+func releasesText(tags []string) string {
+	if len(tags) == 1 {
+		return "new release " + tags[0]
+	}
+	if len(tags) <= 5 {
+		return fmt.Sprintf("%d new releases (%s)", len(tags), strings.Join(tags, ", "))
+	}
+	return fmt.Sprintf("%d new releases (%s, +%d more)", len(tags), strings.Join(tags[:5], ", "), len(tags)-5)
+}
+
+func oneLine(s string) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ReplaceAll(s, "`", "'")
+	if len(s) > 300 {
+		s = s[:300] + "…"
+	}
+	return s
+}
+
+// Check fetches updates for one repository (cloning it first if needed) and archives new releases.
+func (a *Archiver) Check(ctx context.Context, id int64) Result {
+	m := a.lock(id)
+	m.Lock()
+	defer m.Unlock()
+
+	repo, err := a.store.Repo(ctx, id)
+	if err != nil {
+		return Result{Err: err}
+	}
+	res := Result{Repo: repo}
+	log := a.log.With().Int64("repo_id", repo.ID).Str("url", repo.URL).Logger()
+
+	u, err := gitops.ParseRepoURL(repo.URL)
+	if err != nil {
+		res.Err = err
+		return a.finish(ctx, res, log)
+	}
+
+	gctx, cancel := context.WithTimeout(ctx, a.cfg.GitTimeout)
+	defer cancel()
+
+	mirror := a.mirrorDir(repo)
+	if _, statErr := os.Stat(mirror); errors.Is(statErr, os.ErrNotExist) {
+		log.Info().Msg("Cloning repository")
+		if err := a.git.CloneMirror(gctx, repo.URL, mirror); err != nil {
+			res.Err = err
+			return a.finish(ctx, res, log)
+		}
+		res.Cloned = true
+	} else {
+		before, err := a.git.SnapshotRefs(gctx, mirror)
+		if err != nil {
+			res.Err = err
+			return a.finish(ctx, res, log)
+		}
+		if err := a.git.FetchMirror(gctx, mirror, a.cfg.PruneDeleted); err != nil {
+			res.Err = err
+			return a.finish(ctx, res, log)
+		}
+		after, err := a.git.SnapshotRefs(gctx, mirror)
+		if err != nil {
+			res.Err = err
+			return a.finish(ctx, res, log)
+		}
+		res.Change = a.git.Diff(gctx, mirror, before, after)
+	}
+
+	if res.Cloned || !res.Change.Empty() || !dirExists(a.checkoutDir(repo)) {
+		if err := a.git.SyncCheckout(gctx, mirror, a.checkoutDir(repo)); err != nil {
+			res.Warnings = append(res.Warnings, "checkout: "+oneLine(err.Error()))
+		}
+	}
+
+	if a.cfg.Releases.Enabled {
+		tags, warns := a.archiveReleases(ctx, repo, u, log)
+		res.NewReleases = tags
+		res.Warnings = append(res.Warnings, warns...)
+	}
+	return a.finish(ctx, res, log)
+}
+
+func (a *Archiver) finish(ctx context.Context, res Result, log zerolog.Logger) Result {
+	repo := res.Repo
+	wasFailing := repo.FailCount > 0
+	if err := a.store.MarkChecked(ctx, repo.ID, res.Changed(), res.Err); err != nil {
+		log.Err(err).Msg("Failed to save check result")
+	}
+	switch {
+	case res.Err != nil:
+		log.Warn().Err(res.Err).Msg("Check failed")
+		_ = a.store.AddEvent(ctx, repo.ID, store.EventError, oneLine(res.Err.Error()))
+		if n := repo.FailCount + 1; a.cfg.FailureAlert > 0 && n == a.cfg.FailureAlert {
+			a.Notify(ctx, fmt.Sprintf("⚠️ **#%d** %s has failed %d times in a row: `%s`",
+				repo.ID, repo.URL, n, oneLine(res.Err.Error())))
+		}
+	default:
+		if wasFailing {
+			_ = a.store.AddEvent(ctx, repo.ID, store.EventRecovered, "recovered")
+		}
+		if res.Cloned {
+			detail := "initial clone"
+			if len(res.NewReleases) > 0 {
+				detail += fmt.Sprintf(", %d releases archived", len(res.NewReleases))
+			}
+			_ = a.store.AddEvent(ctx, repo.ID, store.EventAdded, detail)
+		} else {
+			if !res.Change.Empty() {
+				detail, _ := json.Marshal(res.Change)
+				_ = a.store.AddEvent(ctx, repo.ID, store.EventUpdate, string(detail))
+			}
+			for _, t := range res.NewReleases {
+				_ = a.store.AddEvent(ctx, repo.ID, store.EventRelease, t)
+			}
+		}
+		log.Debug().Str("result", res.Text()).Msg("Checked repository")
+	}
+	if r, err := a.store.Repo(ctx, repo.ID); err == nil {
+		res.Repo = r
+	}
+	return res
+}
+
+func dirExists(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && st.IsDir()
+}
+
+// provider resolves the release provider for a host; nil if none.
+func (a *Archiver) provider(ctx context.Context, host string) forge.Provider {
+	if f, ok := a.cfg.ForgeFor(host); ok {
+		p, err := a.forge.New(f.Type, host, f.APIURL, f.Token)
+		if err != nil {
+			return nil
+		}
+		return p
+	}
+	typ := forge.KnownHostType(host)
+	if typ == "" {
+		var cached bool
+		typ, cached = a.store.ForgeType(ctx, host, 7*24*time.Hour)
+		if !cached {
+			typ = a.forge.Detect(ctx, host)
+			_ = a.store.SetForgeType(ctx, host, typ)
+			a.log.Info().Str("host", host).Str("type", typ).Msg("Detected forge type")
+		}
+	}
+	if typ == "" {
+		return nil
+	}
+	p, _ := a.forge.New(typ, host, "", "")
+	return p
+}
+
+func (a *Archiver) archiveReleases(ctx context.Context, repo *store.Repo, u gitops.RepoURL, log zerolog.Logger) (newTags, warnings []string) {
+	if u.Owner == "" {
+		return nil, nil
+	}
+	p := a.provider(ctx, u.Host)
+	if p == nil {
+		return nil, nil
+	}
+	rels, err := p.ListReleases(ctx, u.Owner, u.Name)
+	if errors.Is(err, forge.ErrNoRepo) {
+		return nil, nil
+	} else if err != nil {
+		log.Warn().Err(err).Msg("Failed to list releases")
+		return nil, []string{"releases: " + oneLine(err.Error())}
+	}
+	for _, rel := range rels {
+		if rel.Draft || rel.Tag == "" || (rel.Prerelease && !a.cfg.Releases.IncludePrereleases) {
+			continue
+		}
+		if done, err := a.store.HasRelease(ctx, repo.ID, rel.Tag); err != nil || done {
+			continue
+		}
+		if ctx.Err() != nil {
+			break
+		}
+		dir := filepath.Join(a.releasesDir(repo), forge.SafeName(rel.Tag))
+		complete, skipped, err := a.saveRelease(ctx, rel, dir)
+		if err != nil {
+			log.Warn().Err(err).Str("tag", rel.Tag).Msg("Failed to archive release")
+			warnings = append(warnings, fmt.Sprintf("release %s: %s", rel.Tag, oneLine(err.Error())))
+			continue
+		}
+		if len(skipped) > 0 {
+			warnings = append(warnings, fmt.Sprintf("release %s: skipped oversized assets %s", rel.Tag, strings.Join(skipped, ", ")))
+		}
+		if complete {
+			_ = a.store.AddRelease(ctx, repo.ID, rel.Tag, rel.Name, rel.Published)
+			newTags = append(newTags, rel.Tag)
+			log.Info().Str("tag", rel.Tag).Msg("Archived release")
+		}
+	}
+	return newTags, warnings
+}
+
+// saveRelease writes metadata and downloads assets. complete is false if some asset failed
+// in a retryable way (the release will be retried on the next check).
+func (a *Archiver) saveRelease(ctx context.Context, rel forge.Release, dir string) (complete bool, skipped []string, err error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return false, nil, err
+	}
+	if len(rel.Raw) > 0 {
+		var pretty json.RawMessage = rel.Raw
+		if b, err := json.MarshalIndent(pretty, "", "  "); err == nil {
+			pretty = b
+		}
+		if err := os.WriteFile(filepath.Join(dir, "release.json"), pretty, 0o644); err != nil {
+			return false, nil, err
+		}
+	}
+	title := rel.Name
+	if title == "" {
+		title = rel.Tag
+	}
+	notes := fmt.Sprintf("# %s\n\nTag: `%s`  \nPublished: %s\n\n%s\n", title, rel.Tag, rel.Published.Format(time.RFC3339), rel.Body)
+	if err := os.WriteFile(filepath.Join(dir, "notes.md"), []byte(notes), 0o644); err != nil {
+		return false, nil, err
+	}
+	if !a.cfg.Releases.DownloadAssets {
+		return true, nil, nil
+	}
+	complete = true
+	var firstErr error
+	for _, asset := range rel.Assets {
+		_, err := a.forge.Download(ctx, asset, filepath.Join(dir, "assets"), a.cfg.Releases.MaxAssetSize)
+		switch {
+		case err == nil:
+		case errors.Is(err, forge.ErrTooLarge):
+			skipped = append(skipped, asset.Name)
+		default:
+			complete = false
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return complete, skipped, firstErr
+}
+
+// RunCycle checks all repositories with bounded concurrency. Returns false if a cycle was
+// already running.
+func (a *Archiver) RunCycle(ctx context.Context) (results []Result, ran bool) {
+	if !a.cycleRunning.CompareAndSwap(false, true) {
+		return nil, false
+	}
+	defer a.cycleRunning.Store(false)
+
+	repos, err := a.store.Repos(ctx)
+	if err != nil {
+		a.log.Err(err).Msg("Failed to list repos")
+		return nil, true
+	}
+	start := time.Now()
+	a.log.Info().Int("repos", len(repos)).Msg("Starting check cycle")
+
+	jobs := make(chan int64)
+	out := make(chan Result)
+	var wg sync.WaitGroup
+	for i := 0; i < a.cfg.Concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for id := range jobs {
+				out <- a.Check(ctx, id)
+			}
+		}()
+	}
+	go func() {
+		defer close(jobs)
+		for _, r := range repos {
+			select {
+			case jobs <- r.ID:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	go func() { wg.Wait(); close(out) }()
+	for r := range out {
+		results = append(results, r)
+	}
+	a.log.Info().Int("repos", len(results)).Dur("took", time.Since(start)).Msg("Check cycle finished")
+	return results, true
+}
+
+// Run executes the periodic check loop and summary scheduler until ctx is cancelled.
+func (a *Archiver) Run(ctx context.Context) {
+	go a.runSummaries(ctx)
+
+	// Give the bot a moment to connect before the first cycle.
+	select {
+	case <-time.After(10 * time.Second):
+	case <-ctx.Done():
+		return
+	}
+	ticker := time.NewTicker(a.cfg.CheckInterval)
+	defer ticker.Stop()
+	for {
+		a.RunCycle(ctx)
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// Remove deletes a repo from the list and optionally its files on disk.
+func (a *Archiver) Remove(ctx context.Context, repo *store.Repo, purge bool) error {
+	m := a.lock(repo.ID)
+	m.Lock()
+	defer m.Unlock()
+	if err := a.store.RemoveRepo(ctx, repo.ID); err != nil {
+		return err
+	}
+	if purge {
+		if inUse, _ := a.store.RelDirInUse(ctx, repo.RelDir, repo.ID); !inUse {
+			dir := a.RepoDir(repo)
+			// Defensive: never delete outside the storage dir.
+			if rel, err := filepath.Rel(a.cfg.StorageDir, dir); err == nil && rel != "." && !strings.HasPrefix(rel, "..") {
+				return os.RemoveAll(dir)
+			}
+		}
+	}
+	return nil
+}

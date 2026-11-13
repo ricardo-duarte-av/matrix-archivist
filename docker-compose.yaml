@@ -1,0 +1,16 @@
+services:
+  archivist:
+    image: ghcr.io/ricardo-duarte-av/matrix-archivist:latest
+    # build: .            # uncomment to build locally instead
+    container_name: matrix-archivist
+    restart: unless-stopped
+    # Must own ./data on the host: `sudo chown -R 1000:1000 ./data`
+    user: "1000:1000"
+    environment:
+      TZ: Europe/Lisbon
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+      # Holds repos/, archivist.db and crypto.db (keep crypto.db or the bot loses its E2EE identity)
+      - ./data:/data
+      # Optional: SSH key for ssh:// / git@ URLs of private repos
+      # - ./ssh:/home/archivist/.ssh:ro
