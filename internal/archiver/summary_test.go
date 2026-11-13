@@ -69,3 +69,32 @@ storage_dir: /tmp/x
 type errString string
 
 func (e errString) Error() string { return string(e) }
+
+func TestFailureAlertOnce(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "db.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cfg, _ := config.Parse([]byte(`
+matrix: {homeserver: "https://m.example.org", user_id: "@b:example.org", password: x, room_id: "!r:example.org", pickle_key: k}
+storage_dir: ` + t.TempDir()))
+	a := New(cfg, st, zerolog.Nop())
+	var alerts []string
+	a.Alert = func(_ context.Context, s string) { alerts = append(alerts, s) }
+
+	// An invalid stored URL makes every check fail without touching the network.
+	r, _ := st.AddRepo(ctx, "file:///nope", "bad", "bad", "@u:x")
+	for i := 1; i <= 7; i++ {
+		if res := a.Check(ctx, r.ID); res.Err == nil {
+			t.Fatal("expected failure")
+		}
+		if i < cfg.FailureAlert && len(alerts) != 0 {
+			t.Fatalf("alerted early at check %d", i)
+		}
+	}
+	if len(alerts) != 1 || !strings.Contains(alerts[0], "failed 5 times in a row") {
+		t.Fatalf("alerts: %q", alerts)
+	}
+}

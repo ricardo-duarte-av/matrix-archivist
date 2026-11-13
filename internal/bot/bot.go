@@ -110,6 +110,7 @@ func (b *Bot) Run(ctx context.Context) error {
 	}
 
 	b.arch.Notify = b.Notify
+	b.arch.Alert = b.Alert
 	err = b.client.SyncWithContext(ctx)
 	if ctx.Err() != nil {
 		return nil
@@ -292,6 +293,27 @@ func (b *Bot) Notify(ctx context.Context, markdown string) {
 	}
 }
 
+// Alert posts an @room message that notifies everyone in the room. It is sent as m.text,
+// because the default push rules suppress notifications for m.notice.
+func (b *Bot) Alert(ctx context.Context, markdown string) {
+	if ctx.Err() != nil {
+		ctx = b.ctx
+	}
+	c := AlertContent(markdown)
+	if _, err := b.client.SendMessageEvent(ctx, b.roomID, event.EventMessage, c); err != nil {
+		b.log.Err(err).Msg("Failed to send alert")
+	}
+}
+
+// AlertContent builds an @room message: the body starts with "@room" (for clients and push
+// rules that match on the body) and m.mentions.room is set (intentional mentions).
+func AlertContent(markdown string) *event.MessageEventContent {
+	c := format.RenderMarkdown("@room "+markdown, true, false)
+	c.MsgType = event.MsgText
+	c.Mentions = &event.Mentions{Room: true}
+	return &c
+}
+
 // reply sends a message in reply to evt.
 func (b *Bot) reply(evt *event.Event, markdown string) {
 	c := b.content(markdown)
@@ -309,8 +331,21 @@ func (b *Bot) react(evt *event.Event, key string) {
 // refreshState fetches the full room state into the state store (encryption, power levels,
 // create event), so it is correct even if earlier syncs were missed.
 func (b *Bot) refreshState(ctx context.Context) {
-	if _, err := b.client.State(ctx, b.roomID); err != nil {
+	state, err := b.client.State(ctx, b.roomID)
+	if err != nil {
 		b.log.Warn().Err(err).Msg("Failed to fetch room state")
+		return
+	}
+	if b.cfg.FailureAlert > 0 {
+		plEvt := state[event.StatePowerLevels][""]
+		need := 50
+		if plEvt != nil {
+			need = plEvt.Content.AsPowerLevels().Notifications.Room()
+		}
+		if have := UserLevel(plEvt, state[event.StateCreate][""], b.client.UserID); have < need {
+			b.log.Warn().Int("bot_level", have).Int("needed", need).
+				Msg("Bot's power level is too low for @room alerts to notify anyone; raise it in the room settings")
+		}
 	}
 }
 

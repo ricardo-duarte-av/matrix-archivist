@@ -31,7 +31,9 @@ type Archiver struct {
 	forge *forge.Client
 	log   zerolog.Logger
 
+	// Notify posts an informational message; Alert posts one that pings the whole room (@room).
 	Notify Notifier
+	Alert  Notifier
 
 	locksMu sync.Mutex
 	locks   map[int64]*sync.Mutex
@@ -48,6 +50,7 @@ func New(cfg *config.Config, st *store.Store, log zerolog.Logger) *Archiver {
 		log:    log,
 		locks:  map[int64]*sync.Mutex{},
 		Notify: func(context.Context, string) {},
+		Alert:  func(context.Context, string) {},
 	}
 }
 
@@ -198,12 +201,15 @@ func (a *Archiver) finish(ctx context.Context, res Result, log zerolog.Logger) R
 		log.Warn().Err(res.Err).Msg("Check failed")
 		_ = a.store.AddEvent(ctx, repo.ID, store.EventError, oneLine(res.Err.Error()))
 		if n := repo.FailCount + 1; a.cfg.FailureAlert > 0 && n == a.cfg.FailureAlert {
-			a.Notify(ctx, fmt.Sprintf("⚠️ **#%d** %s has failed %d times in a row: `%s`",
-				repo.ID, repo.URL, n, oneLine(res.Err.Error())))
+			a.Alert(ctx, FailureAlertText(repo, n, res.Err))
 		}
 	default:
 		if wasFailing {
 			_ = a.store.AddEvent(ctx, repo.ID, store.EventRecovered, "recovered")
+			// Only announce recovery if the room was alerted about the failure.
+			if a.cfg.FailureAlert > 0 && repo.FailCount >= a.cfg.FailureAlert {
+				a.Notify(ctx, fmt.Sprintf("✅ **#%d** %s is working again after %d failed checks.", repo.ID, repo.URL, repo.FailCount))
+			}
 		}
 		if res.Cloned {
 			detail := "initial clone"
@@ -226,6 +232,12 @@ func (a *Archiver) finish(ctx context.Context, res Result, log zerolog.Logger) R
 		res.Repo = r
 	}
 	return res
+}
+
+// FailureAlertText is the body of the @room alert sent when a repo hits the failure threshold.
+func FailureAlertText(repo *store.Repo, failures int, err error) string {
+	return fmt.Sprintf("🚨 **#%d** %s has failed %d times in a row.\n\nLast error: `%s`",
+		repo.ID, repo.URL, failures, oneLine(err.Error()))
 }
 
 func dirExists(p string) bool {

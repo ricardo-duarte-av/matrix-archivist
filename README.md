@@ -118,6 +118,12 @@ See [`config.example.yaml`](config.example.yaml); every option is commented ther
 | `forges` | API tokens and self-hosted forges. A GitHub token is strongly recommended: without one the API allows 60 requests/hour. |
 | `prune_deleted` | Whether branches and tags deleted upstream are deleted from the archive too. Default `false`: they are kept. |
 
+## Failure alerts
+
+When a repository fails `failure_alert_threshold` checks in a row (default 5), the bot posts an **@room** alert with the last error. When it works again, it posts a normal message saying so.
+
+For @room to notify anyone, the bot needs the room's "Notify everyone" power level, which is 50 by default. In Element, give the bot Moderator, or lower that permission under Room settings → Roles & Permissions. If its level is too low, the bot logs a warning at startup.
+
 ## Notes
 
 - **First sync can take a while** for projects with many releases and large assets (a CLI with 30 binaries × 300 releases, for example). Use `releases.max_asset_size` or `download_assets: false` to limit this.

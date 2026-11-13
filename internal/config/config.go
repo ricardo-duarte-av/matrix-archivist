@@ -101,7 +101,7 @@ func defaults() *Config {
 		CheckIntervalRaw: "1h",
 		Concurrency:      3,
 		GitTimeoutRaw:    "30m",
-		FailureAlert:     3,
+		FailureAlert:     5,
 		LogLevel:         "info",
 		Summary: Summary{
 			Enabled:  true,

@@ -6,6 +6,7 @@ import (
 	"math"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"go.mau.fi/util/dbutil"
@@ -140,5 +141,19 @@ func TestUserLevelCreators(t *testing.T) {
 		if got := UserLevel(c.pl, c.cr, c.user); got != c.want {
 			t.Errorf("%s: got %d, want %d", c.name, got, c.want)
 		}
+	}
+}
+
+func TestAlertContent(t *testing.T) {
+	c := AlertContent("**#3** x failed")
+	if c.MsgType != event.MsgText || c.Mentions == nil || !c.Mentions.Room {
+		t.Fatalf("not an @room m.text message: %+v", c)
+	}
+	if !strings.HasPrefix(c.Body, "@room ") {
+		t.Errorf("body %q", c.Body)
+	}
+	raw, _ := json.Marshal(c)
+	if !strings.Contains(string(raw), `"m.mentions":{"room":true}`) {
+		t.Errorf("json %s", raw)
 	}
 }

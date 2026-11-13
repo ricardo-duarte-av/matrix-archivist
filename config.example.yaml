@@ -33,7 +33,9 @@ crypto_database: /data/crypto.db
 check_interval: 1h        # how often every repo is checked for updates (>= 1m)
 concurrency: 3            # repos checked in parallel
 git_timeout: 30m          # per clone/fetch
-failure_alert_threshold: 3   # post an alert after this many consecutive failures (0 = off)
+# After this many consecutive failed checks of a repo, post an @room alert (0 = off).
+# The bot needs the room's "notify everyone" power level (default 50) for @room to ping.
+failure_alert_threshold: 5
 # Delete branches/tags locally when they are deleted upstream. false = keep them (safer for an archive).
 prune_deleted: false
 log_level: info           # debug, info, warn, error
