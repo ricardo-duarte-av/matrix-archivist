@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{if .IsRoot}}Archivist{{else}}{{.ZipName}} · Archivist{{end}}</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+<header>
+  <nav class="crumbs" aria-label="Path">
+    {{- range $i, $c := .Crumbs -}}
+      {{- if $i}}<span class="sep">/</span>{{end -}}
+      <a href="/browse/{{path $c.Path}}{{if $c.Path}}/{{end}}">{{$c.Name}}</a>
+    {{- end -}}
+  </nav>
+  <a class="button" href="/zip/{{path .Path}}" title="Download this folder as a zip">
+    <svg class="icon" aria-hidden="true"><use href="/static/icons.svg#zip"></use></svg>
+    <span>Download {{.ZipName}}.zip</span>
+  </a>
+</header>
+
+<main>
+<table>
+  <thead>
+    <tr><th class="name">Name</th><th class="size">Size</th><th class="mtime">Modified</th><th class="act"><span class="sr">Download</span></th></tr>
+  </thead>
+  <tbody>
+  {{- if not .IsRoot}}
+    <tr class="up">
+      <td class="name" colspan="4"><a href="/browse/{{path .Parent}}{{if .Parent}}/{{end}}">
+        <svg class="icon" aria-hidden="true"><use href="/static/icons.svg#up"></use></svg>..</a></td>
+    </tr>
+  {{- end}}
+  {{- range .Entries}}
+    {{- if .IsDir}}
+    <tr class="dir">
+      <td class="name"><a href="/browse/{{path .Path}}/">
+        <svg class="icon" aria-hidden="true"><use href="/static/icons.svg#folder"></use></svg>{{.Name}}</a></td>
+      <td class="size">—</td>
+      <td class="mtime">{{time .ModTime}}</td>
+      <td class="act"><a class="iconbtn" href="/zip/{{path .Path}}" title="Download {{.Name}} as zip" aria-label="Download {{.Name}} as zip">
+        <svg class="icon" aria-hidden="true"><use href="/static/icons.svg#zip"></use></svg></a></td>
+    </tr>
+    {{- else}}
+    <tr class="file">
+      <td class="name"><a href="/download/{{path .Path}}" download>
+        <svg class="icon" aria-hidden="true"><use href="/static/icons.svg#file"></use></svg>{{.Name}}</a></td>
+      <td class="size">{{size .Size}}</td>
+      <td class="mtime">{{time .ModTime}}</td>
+      <td class="act"><a class="iconbtn" href="/download/{{path .Path}}" download title="Download {{.Name}}" aria-label="Download {{.Name}}">
+        <svg class="icon" aria-hidden="true"><use href="/static/icons.svg#download"></use></svg></a></td>
+    </tr>
+    {{- end}}
+  {{- else}}
+    <tr><td colspan="4" class="empty">This folder is empty.</td></tr>
+  {{- end}}
+  </tbody>
+</table>
+</main>
+<footer>matrix-archivist</footer>
+</body>
+</html>

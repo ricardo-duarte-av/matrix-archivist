@@ -19,4 +19,6 @@ RUN apk add --no-cache git openssh-client ca-certificates tzdata \
 COPY --from=build /out/archivist /usr/local/bin/archivist
 USER archivist
 VOLUME ["/data"]
+EXPOSE 8080
+HEALTHCHECK --interval=1m --timeout=5s --start-period=30s CMD ["archivist", "-config", "/config/config.yaml", "-healthcheck"]
 ENTRYPOINT ["archivist", "-config", "/config/config.yaml"]

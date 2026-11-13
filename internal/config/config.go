@@ -52,6 +52,23 @@ type Forge struct {
 	APIURL string `yaml:"api_url"`
 }
 
+type HTTP struct {
+	Enabled bool   `yaml:"enabled"`
+	Bind    string `yaml:"bind"`
+	Port    int    `yaml:"port"`
+	// PublicURL is the externally reachable base URL (e.g. https://archive.example.org), used for
+	// links in bot messages. Optional.
+	PublicURL string `yaml:"public_url"`
+	// Optional HTTP basic auth. Both must be set to enable it.
+	Username string `yaml:"username"`
+	Password string `yaml:"password"`
+	// Maximum number of zip downloads generated at the same time.
+	MaxConcurrentZips int `yaml:"max_concurrent_zips"`
+}
+
+// Addr is the listen address, e.g. "0.0.0.0:8080".
+func (h HTTP) Addr() string { return fmt.Sprintf("%s:%d", h.Bind, h.Port) }
+
 type Config struct {
 	Matrix           Matrix   `yaml:"matrix"`
 	CommandPrefix    string   `yaml:"command_prefix"`
@@ -68,6 +85,7 @@ type Config struct {
 	Summary          Summary  `yaml:"summary"`
 	Releases         Releases `yaml:"releases"`
 	Forges           []Forge  `yaml:"forges"`
+	HTTP             HTTP     `yaml:"http"`
 
 	CheckInterval time.Duration `yaml:"-"`
 	GitTimeout    time.Duration `yaml:"-"`
@@ -89,6 +107,12 @@ func defaults() *Config {
 			Enabled:  true,
 			Time:     "09:00",
 			Timezone: "UTC",
+		},
+		HTTP: HTTP{
+			Enabled:           true,
+			Bind:              "0.0.0.0",
+			Port:              8080,
+			MaxConcurrentZips: 2,
 		},
 		Releases: Releases{
 			Enabled:            true,
@@ -191,6 +215,22 @@ func (c *Config) validate() error {
 
 	if c.Releases.MaxAssetSize, err = ParseSize(c.Releases.MaxAssetSizeRaw); err != nil {
 		add("releases.max_asset_size: %v", err)
+	}
+
+	if c.HTTP.Enabled {
+		if c.HTTP.Port < 1 || c.HTTP.Port > 65535 {
+			add("http.port must be between 1 and 65535")
+		}
+		if (c.HTTP.Username == "") != (c.HTTP.Password == "") {
+			add("http.username and http.password must both be set (or both empty)")
+		}
+		if c.HTTP.MaxConcurrentZips < 1 {
+			c.HTTP.MaxConcurrentZips = 1
+		}
+		c.HTTP.PublicURL = strings.TrimRight(c.HTTP.PublicURL, "/")
+		if c.HTTP.PublicURL != "" && !strings.HasPrefix(c.HTTP.PublicURL, "http://") && !strings.HasPrefix(c.HTTP.PublicURL, "https://") {
+			add("http.public_url must start with http:// or https://")
+		}
 	}
 
 	for i := range c.Forges {

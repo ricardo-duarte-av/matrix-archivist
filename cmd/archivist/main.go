@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -16,6 +17,7 @@ import (
 	"github.com/ricardo-duarte-av/matrix-archivist/internal/bot"
 	"github.com/ricardo-duarte-av/matrix-archivist/internal/config"
 	"github.com/ricardo-duarte-av/matrix-archivist/internal/store"
+	"github.com/ricardo-duarte-av/matrix-archivist/internal/web"
 )
 
 var version = "dev"
@@ -23,10 +25,14 @@ var version = "dev"
 func main() {
 	cfgPath := flag.String("config", "config.yaml", "path to config.yaml")
 	showVersion := flag.Bool("version", false, "print version and exit")
+	healthcheck := flag.Bool("healthcheck", false, "check the running instance's HTTP server and exit (for Docker HEALTHCHECK)")
 	flag.Parse()
 	if *showVersion {
 		fmt.Println(version)
 		return
+	}
+	if *healthcheck {
+		os.Exit(runHealthcheck(*cfgPath))
 	}
 
 	noColor := true
@@ -66,10 +72,44 @@ func main() {
 
 	log.Info().Str("version", version).Str("room", cfg.Matrix.RoomID).Msg("Starting matrix-archivist")
 	go arch.Run(ctx)
+	if cfg.HTTP.Enabled {
+		srv, err := web.New(cfg.HTTP, cfg.StorageDir, log.With().Str("component", "http").Logger())
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to create HTTP server")
+		}
+		go func() {
+			if err := srv.Run(ctx); err != nil {
+				log.Error().Err(err).Msg("HTTP server stopped")
+			}
+		}()
+	}
 	if err := b.Run(ctx); err != nil {
 		log.Error().Err(err).Msg("Bot stopped with error")
 		stop()
 		os.Exit(1)
 	}
 	log.Info().Msg("Shutting down")
+}
+
+func runHealthcheck(cfgPath string) int {
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	if !cfg.HTTP.Enabled {
+		return 0
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/healthz", cfg.HTTP.Port))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintln(os.Stderr, resp.Status)
+		return 1
+	}
+	return 0
 }

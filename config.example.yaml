@@ -50,6 +50,18 @@ releases:
   max_asset_size: 2GB     # larger assets are skipped (0 = unlimited)
   include_prereleases: true
 
+# Read-only web file browser for storage_dir: download single files, or whole folders as zip.
+http:
+  enabled: true
+  bind: 0.0.0.0
+  port: 8080
+  # Externally reachable URL (e.g. behind a reverse proxy); adds "Browse" links to !archivist status.
+  public_url: ""
+  # Optional HTTP basic auth (recommended if the archive is reachable from the internet).
+  username: ""
+  password: ""
+  max_concurrent_zips: 2
+
 # Release APIs. github.com, gitlab.com, codeberg.org and a few other well-known hosts are detected
 # automatically, and unknown hosts are probed for a Gitea/Forgejo or GitLab API.
 # Add entries for tokens (higher rate limits / private repos) or self-hosted forges.

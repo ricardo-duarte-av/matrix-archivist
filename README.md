@@ -8,6 +8,7 @@ and posts a daily summary of what changed.
 - **Releases:** archives release notes, raw metadata and downloadable assets from **GitHub**, **Gitea / Forgejo / Codeberg** and **GitLab**, including self-hosted instances, which are detected automatically.
 - **End-to-end encryption:** works in encrypted rooms, with pure-Go crypto (no libolm or CGO).
 - **Permissions:** commands that change things require a minimum room power level.
+- **Web file browser:** a read-only listing of the archive. Download single files (resumable), or any folder as a zip.
 - **Single static binary:** multi-arch Docker image (amd64/arm64).
 
 ## Commands
@@ -47,6 +48,23 @@ Local paths and `file://` are rejected.
 ```
 
 To restore a repository from the archive, run `git clone /data/repos/github.com/owner/repo/mirror.git`.
+
+## Web file browser
+
+When `http.enabled` is true, the bot serves a read-only browser for `storage_dir` on `http.port` (default 8080):
+
+| URL | What it does |
+|---|---|
+| `/browse/<path>/` | Folder listing |
+| `/download/<path>` | Download one file. Supports resume (HTTP Range). |
+| `/zip/<path>` | Download a folder as a zip. It is built on the fly, so no temp files are written. |
+| `/healthz` | Liveness check, used by the Docker `HEALTHCHECK`. |
+
+- **Static files:** the CSS, icons and template are compiled into the binary, so the container needs nothing extra.
+- **Safe paths:** requests can't escape `storage_dir`. That includes `..` paths and symlinks pointing outside it.
+- **Access:** there is no login by default. Set `http.username`/`http.password` for basic auth, or put the browser behind a reverse proxy that adds TLS and auth.
+- **Links in the room:** with `http.public_url` set, `!archivist status` includes "Browse" links.
+- **Changing the port:** keep the container side of the compose port mapping in step with `http.port`. The healthcheck reads the port from the config.
 
 ## Running with Docker Compose
 

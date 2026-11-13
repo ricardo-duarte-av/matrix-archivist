@@ -3,6 +3,7 @@ package bot
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -293,6 +294,9 @@ func (b *Bot) cmdStatus(evt *event.Event, args []string) {
 		fmt.Fprintf(&sb, "- Last checked: %s · last changed: %s\n", ago(r.LastChecked), ago(r.LastChanged))
 		fmt.Fprintf(&sb, "- Releases archived: %d\n", nrel)
 		fmt.Fprintf(&sb, "- Disk usage: %s (`%s`)\n", gitops.HumanSize(gitops.DirSize(b.arch.RepoDir(r))), r.RelDir)
+		if u := b.browseURL(r.RelDir); u != "" {
+			fmt.Fprintf(&sb, "- Browse: %s\n", u)
+		}
 		if r.LastError != "" {
 			fmt.Fprintf(&sb, "- Last error: `%s`\n", strings.ReplaceAll(r.LastError, "`", "'"))
 		}
@@ -315,6 +319,9 @@ func (b *Bot) cmdStatus(evt *event.Event, args []string) {
 	fmt.Fprintf(&sb, "- Repositories: %d (%d failing)\n", len(repos), failing)
 	fmt.Fprintf(&sb, "- Storage used: %s\n", gitops.HumanSize(gitops.DirSize(b.cfg.StorageDir)))
 	fmt.Fprintf(&sb, "- Check interval: %s\n", b.cfg.CheckInterval)
+	if u := b.browseURL(""); u != "" {
+		fmt.Fprintf(&sb, "- Browse: %s\n", u)
+	}
 	if b.cfg.Summary.Enabled {
 		s := b.cfg.Summary
 		next := archiver.NextSummary(time.Now(), s.Hour, s.Minute, s.Location)
@@ -326,4 +333,20 @@ func (b *Bot) cmdStatus(evt *event.Event, args []string) {
 
 func (b *Bot) cmdSummary(_ *event.Event, _ []string) {
 	b.arch.PostSummary(b.ctx, false)
+}
+
+// browseURL returns the public file-browser URL for a storage-relative directory, or "".
+func (b *Bot) browseURL(relDir string) string {
+	h := b.cfg.HTTP
+	if !h.Enabled || h.PublicURL == "" {
+		return ""
+	}
+	if relDir == "" {
+		return h.PublicURL + "/browse/"
+	}
+	parts := strings.Split(relDir, "/")
+	for i, p := range parts {
+		parts[i] = url.PathEscape(p)
+	}
+	return h.PublicURL + "/browse/" + strings.Join(parts, "/") + "/"
 }
