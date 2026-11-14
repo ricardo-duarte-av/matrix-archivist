@@ -20,12 +20,14 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
 
 	"github.com/ricardo-duarte-av/matrix-archivist/internal/config"
 	"github.com/ricardo-duarte-av/matrix-archivist/internal/gitops"
+	"github.com/ricardo-duarte-av/matrix-archivist/internal/live"
 )
 
 //go:embed templates/*.html
@@ -43,6 +45,10 @@ type Server struct {
 
 	// Metrics writes Prometheus metrics; served at /metrics when set and http.metrics is on.
 	Metrics func(ctx context.Context, w io.Writer) error
+	// Live is the archiver's activity hub; the live page is served when set and http.live is on.
+	Live *live.Hub
+
+	streams atomic.Int32 // open /live/events connections
 }
 
 func New(cfg config.HTTP, storageDir string, log zerolog.Logger) (*Server, error) {
@@ -75,6 +81,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /zip/{path...}", s.handleZip)
 	if s.cfg.Metrics && s.Metrics != nil {
 		mux.HandleFunc("GET /metrics", s.handleMetrics)
+	}
+	if s.cfg.Live && s.Live != nil {
+		mux.HandleFunc("GET /live/{$}", s.handleLivePage)
+		mux.HandleFunc("GET /live", func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "/live/", http.StatusMovedPermanently)
+		})
+		mux.HandleFunc("GET /live/events", s.handleLiveEvents)
 	}
 
 	var h http.Handler = mux
@@ -151,6 +164,10 @@ func (s *Server) handleBrowse(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer root.Close()
+	if err := checkPath(root, rel); err != nil {
+		s.fail(w, err)
+		return
+	}
 
 	st, err := root.Stat(rel)
 	if err != nil {
@@ -190,13 +207,10 @@ func (s *Server) handleBrowse(w http.ResponseWriter, r *http.Request) {
 			p = rel + "/" + d.Name()
 		}
 		isDir := d.IsDir()
-		if d.Type()&fs.ModeSymlink != 0 {
-			// Resolve within the root only; skip links that escape or dangle.
-			target, err := root.Stat(p)
-			if err != nil {
-				continue
-			}
-			info, isDir = target, target.IsDir()
+		// Symlinks are never followed (an archived repo could point one at another repo's
+		// git config), and git config files can hold credentials from the clone URL.
+		if !d.Type().IsRegular() && !isDir || hiddenPath(p) {
+			continue
 		}
 		data.Entries = append(data.Entries, entry{Name: d.Name(), Path: p, IsDir: isDir, Size: info.Size(), ModTime: info.ModTime()})
 	}
@@ -236,6 +250,10 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer root.Close()
+	if err := checkPath(root, rel); err != nil {
+		s.fail(w, err)
+		return
+	}
 	f, err := root.Open(rel)
 	if err != nil {
 		s.fail(w, err)
@@ -265,6 +283,10 @@ func (s *Server) handleZip(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer root.Close()
+	if err := checkPath(root, rel); err != nil {
+		s.fail(w, err)
+		return
+	}
 	st, err := root.Stat(rel)
 	if err != nil {
 		s.fail(w, err)
@@ -322,7 +344,7 @@ func writeZip(ctx context.Context, w io.Writer, fsys fs.FS, dir, prefix string) 
 			_, err := zw.CreateHeader(&zip.FileHeader{Name: name + "/", Method: zip.Store})
 			return err
 		}
-		if !d.Type().IsRegular() {
+		if !d.Type().IsRegular() || hiddenPath(p) {
 			return nil
 		}
 		info, err := d.Info()
@@ -385,6 +407,43 @@ func attachment(name string) string {
 	return "attachment"
 }
 
+// errHidden is returned for paths the browser refuses to serve.
+var errHidden = fmt.Errorf("%w: hidden path", fs.ErrNotExist)
+
+// checkPath refuses paths that go through a symlink or point at a hidden file. (os.Root
+// already stops symlinks leaving the storage dir; this also stops those that stay inside.)
+func checkPath(root *os.Root, rel string) error {
+	if rel == "." {
+		return nil
+	}
+	if hiddenPath(rel) {
+		return errHidden
+	}
+	parts := strings.Split(rel, "/")
+	for i := range parts {
+		st, err := root.Lstat(strings.Join(parts[:i+1], "/"))
+		if err != nil {
+			return err
+		}
+		if st.Mode()&fs.ModeSymlink != 0 {
+			return errHidden
+		}
+	}
+	return nil
+}
+
+// hiddenPath reports git config files (mirror.git/config, checkout/.git/config): they may
+// contain credentials from a clone URL like https://user:token@host/….
+func hiddenPath(rel string) bool {
+	parts := strings.Split(rel, "/")
+	for i := 1; i < len(parts); i++ {
+		if parts[i] == "config" && (parts[i-1] == ".git" || strings.HasSuffix(parts[i-1], ".git")) {
+			return true
+		}
+	}
+	return false
+}
+
 // escapePath URL-escapes each segment of a slash-separated path.
 func escapePath(p string) string {
 	parts := strings.Split(p, "/")
@@ -401,8 +460,9 @@ func (s *Server) fail(w http.ResponseWriter, err error) {
 	case errors.Is(err, fs.ErrPermission), strings.Contains(err.Error(), "escapes from parent"), strings.Contains(err.Error(), "path escapes"):
 		http.Error(w, "forbidden", http.StatusForbidden)
 	default:
+		// Details (which include server paths) go to the log only.
 		s.log.Warn().Err(err).Msg("HTTP error")
-		http.Error(w, fmt.Sprintf("error: %v", err), http.StatusInternalServerError)
+		http.Error(w, "internal error", http.StatusInternalServerError)
 	}
 }
 

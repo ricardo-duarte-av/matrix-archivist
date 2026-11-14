@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/ricardo-duarte-av/matrix-archivist/internal/live"
 )
 
 const userAgent = "matrix-archivist (+https://github.com/ricardo-duarte-av/matrix-archivist)"
@@ -227,7 +229,16 @@ func (c *Client) Download(ctx context.Context, a Asset, dir string, maxSize int6
 	if maxSize > 0 {
 		src = io.LimitReader(resp.Body, maxSize+1)
 	}
-	n, err := io.Copy(f, src)
+	total := a.Size
+	if total == 0 && resp.ContentLength > 0 {
+		total = resp.ContentLength
+	}
+	var out io.Writer = f
+	if slot := live.From(ctx); slot != nil {
+		slot.Progress(0, total, "bytes")
+		out = &progressFile{f: f, report: func(n int64) { slot.Progress(n, total, "bytes") }}
+	}
+	n, err := io.Copy(out, src)
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
@@ -242,6 +253,20 @@ func (c *Client) Download(ctx context.Context, a Asset, dir string, maxSize int6
 		return false, err
 	}
 	return true, os.Rename(tmp, dst)
+}
+
+// progressFile reports bytes written.
+type progressFile struct {
+	f      *os.File
+	n      int64
+	report func(int64)
+}
+
+func (p *progressFile) Write(b []byte) (int, error) {
+	n, err := p.f.Write(b)
+	p.n += int64(n)
+	p.report(p.n)
+	return n, err
 }
 
 // SafeName turns a tag or asset name into a single safe path component.

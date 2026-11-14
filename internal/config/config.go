@@ -78,6 +78,10 @@ type HTTP struct {
 	Metrics bool `yaml:"metrics"`
 	// Widget adds the file browser to the room as a widget (needs public_url).
 	Widget Widget `yaml:"widget"`
+	// Live serves the live activity page at /live/.
+	Live bool `yaml:"live"`
+	// ActivityWidget adds the live activity page to the room as a second widget.
+	ActivityWidget Widget `yaml:"activity_widget"`
 }
 
 type Widget struct {
@@ -107,23 +111,27 @@ func (h HTTP) BrowseURL(relDir string) string {
 func (h HTTP) Addr() string { return fmt.Sprintf("%s:%d", h.Bind, h.Port) }
 
 type Config struct {
-	Matrix           Matrix   `yaml:"matrix"`
-	CommandPrefix    string   `yaml:"command_prefix"`
-	MinPowerLevel    int      `yaml:"min_power_level"`
-	StorageDir       string   `yaml:"storage_dir"`
-	Database         string   `yaml:"database"`
-	CryptoDatabase   string   `yaml:"crypto_database"`
-	CheckIntervalRaw string   `yaml:"check_interval"`
-	Concurrency      int      `yaml:"concurrency"`
-	GitTimeoutRaw    string   `yaml:"git_timeout"`
-	FailureAlert     int      `yaml:"failure_alert_threshold"`
-	PruneDeleted     bool     `yaml:"prune_deleted"`
-	DiskWarnFreeRaw  string   `yaml:"disk_warn_free"`
-	LogLevel         string   `yaml:"log_level"`
-	Summary          Summary  `yaml:"summary"`
-	Releases         Releases `yaml:"releases"`
-	Forges           []Forge  `yaml:"forges"`
-	HTTP             HTTP     `yaml:"http"`
+	Matrix           Matrix `yaml:"matrix"`
+	CommandPrefix    string `yaml:"command_prefix"`
+	MinPowerLevel    int    `yaml:"min_power_level"`
+	StorageDir       string `yaml:"storage_dir"`
+	Database         string `yaml:"database"`
+	CryptoDatabase   string `yaml:"crypto_database"`
+	CheckIntervalRaw string `yaml:"check_interval"`
+	Concurrency      int    `yaml:"concurrency"`
+	GitTimeoutRaw    string `yaml:"git_timeout"`
+	FailureAlert     int    `yaml:"failure_alert_threshold"`
+	PruneDeleted     bool   `yaml:"prune_deleted"`
+	// AllowInternalHosts lets the bot fetch forge APIs and release assets from internal
+	// networks (a forge on your LAN). Off by default: a forge could otherwise point an asset
+	// URL at an internal service and have the response archived and served publicly.
+	AllowInternalHosts bool     `yaml:"allow_internal_hosts"`
+	DiskWarnFreeRaw    string   `yaml:"disk_warn_free"`
+	LogLevel           string   `yaml:"log_level"`
+	Summary            Summary  `yaml:"summary"`
+	Releases           Releases `yaml:"releases"`
+	Forges             []Forge  `yaml:"forges"`
+	HTTP               HTTP     `yaml:"http"`
 
 	CheckInterval time.Duration `yaml:"-"`
 	GitTimeout    time.Duration `yaml:"-"`
@@ -155,6 +163,8 @@ func defaults() *Config {
 			MaxConcurrentZips: 2,
 			Metrics:           true,
 			Widget:            Widget{Enabled: true, Name: "Archive"},
+			Live:              true,
+			ActivityWidget:    Widget{Enabled: true, Name: "Archive activity"},
 		},
 		Releases: Releases{
 			Enabled:            true,

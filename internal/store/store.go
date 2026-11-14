@@ -530,6 +530,22 @@ func (s *Store) Set(ctx context.Context, key, value string) error {
 	return err
 }
 
+// About describes the repository in one line: the forge description, else the README's
+// first paragraph, else its title (unless that is just the repository name).
+func (r *Repo) About() string {
+	if r.Description != "" {
+		return r.Description
+	}
+	if r.ReadmeSummary != "" {
+		return r.ReadmeSummary
+	}
+	name := r.URL[strings.LastIndex(strings.TrimSuffix(r.URL, "/"), "/")+1:]
+	if t := r.ReadmeTitle; t != "" && !strings.EqualFold(strings.Trim(t, " "), strings.Trim(name, "/")) {
+		return t
+	}
+	return ""
+}
+
 func splitLines(s string) []string {
 	var out []string
 	for _, l := range strings.Split(s, "\n") {

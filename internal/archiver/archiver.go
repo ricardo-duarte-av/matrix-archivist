@@ -19,6 +19,7 @@ import (
 	"github.com/ricardo-duarte-av/matrix-archivist/internal/config"
 	"github.com/ricardo-duarte-av/matrix-archivist/internal/forge"
 	"github.com/ricardo-duarte-av/matrix-archivist/internal/gitops"
+	"github.com/ricardo-duarte-av/matrix-archivist/internal/live"
 	"github.com/ricardo-duarte-av/matrix-archivist/internal/store"
 )
 
@@ -41,7 +42,8 @@ type Archiver struct {
 
 	cycleRunning atomic.Bool
 
-	activity sync.Map // repo id → activity
+	// Live is what the archiver is doing right now, for the live activity page.
+	Live *live.Hub
 
 	// Counters exposed as metrics.
 	checksOK, checksFailed atomic.Int64
@@ -50,37 +52,29 @@ type Archiver struct {
 }
 
 func New(cfg *config.Config, st *store.Store, log zerolog.Logger) *Archiver {
+	fc := forge.NewClient()
+	if !cfg.AllowInternalHosts {
+		fc.BlockInternal()
+	}
+	hub := live.New(cfg.Concurrency)
+	hub.Disk = func() (uint64, uint64, error) { return FreeSpace(cfg.StorageDir) }
 	return &Archiver{
 		cfg:    cfg,
 		store:  st,
 		git:    gitops.New(),
-		forge:  forge.NewClient(),
+		forge:  fc,
 		log:    log,
 		locks:  map[int64]*sync.Mutex{},
 		Notify: func(context.Context, string) {},
 		Alert:  func(context.Context, string) {},
+		Live:   hub,
 	}
-}
-
-type activity struct {
-	what  string
-	since time.Time
-}
-
-func (a *Archiver) setActivity(id int64, what string) {
-	since := time.Now()
-	if old, ok := a.activity.Load(id); ok {
-		since = old.(activity).since // time since the check started
-	}
-	a.activity.Store(id, activity{what, since})
 }
 
 // Annotate fills in Activity for repositories that are being checked right now.
 func (a *Archiver) Annotate(repos ...*store.Repo) {
 	for _, r := range repos {
-		if v, ok := a.activity.Load(r.ID); ok {
-			r.Activity, r.ActivitySince = v.(activity).what, v.(activity).since
-		}
+		r.Activity, r.ActivitySince = a.Live.Activity(r.ID)
 	}
 }
 
@@ -178,12 +172,18 @@ func (a *Archiver) Check(ctx context.Context, id int64) Result {
 
 // check does the work of Check; the caller holds the repo's lock.
 func (a *Archiver) check(ctx context.Context, id int64) Result {
-	defer a.activity.Delete(id)
+	slot := live.From(ctx)
+	if slot == nil {
+		slot = a.Live.Temp("Manual check")
+		ctx = live.WithSlot(ctx, slot)
+	}
+	defer slot.End()
 
 	repo, err := a.store.Repo(ctx, id)
 	if err != nil {
 		return Result{Err: err}
 	}
+	slot.Begin(repo.ID, repo.URL, oneLine(repo.About()))
 	res := Result{Repo: repo}
 	log := a.log.With().Int64("repo_id", repo.ID).Str("url", repo.URL).Logger()
 
@@ -200,7 +200,7 @@ func (a *Archiver) check(ctx context.Context, id int64) Result {
 	mirror := a.mirrorDir(repo)
 	if _, statErr := os.Stat(mirror); errors.Is(statErr, os.ErrNotExist) {
 		log.Info().Msg("Cloning repository")
-		a.setActivity(id, "cloning")
+		slot.SetStep("Cloning", "")
 		if err := a.git.CloneMirror(gctx, repo.URL, mirror); err != nil {
 			res.Err = err
 			return a.finish(ctx, res, log)
@@ -208,7 +208,7 @@ func (a *Archiver) check(ctx context.Context, id int64) Result {
 		res.Cloned = true
 		_ = a.store.MarkCloned(ctx, id)
 	} else {
-		a.setActivity(id, "fetching")
+		slot.SetStep("Fetching", "")
 		before, err := a.git.SnapshotRefs(gctx, mirror)
 		if err != nil {
 			res.Err = err
@@ -226,6 +226,7 @@ func (a *Archiver) check(ctx context.Context, id int64) Result {
 		res.Change = a.git.Diff(gctx, mirror, before, after)
 		if res.Change.Destructive() {
 			stamp := time.Now().UTC().Format("20060102T150405Z")
+			slot.SetStep("Preserving rewritten history", "")
 			n, err := a.git.PreserveRefs(gctx, mirror, before, &res.Change, stamp)
 			if err != nil {
 				log.Err(err).Msg("Failed to preserve rewritten refs")
@@ -239,6 +240,7 @@ func (a *Archiver) check(ctx context.Context, id int64) Result {
 	res.branch = a.git.DefaultBranch(gctx, mirror)
 
 	if res.Cloned || !res.Change.Empty() || !dirExists(a.checkoutDir(repo)) {
+		slot.SetStep("Updating checkout", "")
 		if err := a.git.SyncCheckout(gctx, mirror, a.checkoutDir(repo)); err != nil {
 			res.Warnings = append(res.Warnings, "checkout: "+oneLine(err.Error()))
 		}
@@ -263,6 +265,7 @@ func (a *Archiver) finish(ctx context.Context, res Result, log zerolog.Logger) R
 		a.checksFailed.Add(1)
 		log.Warn().Err(res.Err).Msg("Check failed")
 		_ = a.store.AddEvent(ctx, repo.ID, store.EventError, oneLine(res.Err.Error()))
+		a.Live.Event(repo.ID, repo.URL, "error", "Check failed: "+oneLine(res.Err.Error()))
 		alerted := repo.Upstream != ""
 		// Only archived repos can "disappear"; a never-cloned one is just a bad URL.
 		if st := a.probeUpstream(ctx, res); repo.Cloned && st.State == forge.Gone || st.State == forge.Legal || st.State == forge.Blocked {
@@ -270,6 +273,7 @@ func (a *Archiver) finish(ctx context.Context, res Result, log zerolog.Logger) R
 			if repo.Upstream != st.State {
 				log.Warn().Str("state", st.State).Str("detail", st.Detail).Msg("Repository disappeared upstream")
 				_ = a.store.AddEvent(ctx, repo.ID, store.EventGone, st.State+": "+st.Detail)
+				a.Live.Event(repo.ID, repo.URL, "gone", "Disappeared upstream ("+st.State+"): "+st.Detail+"; archive preserved")
 				nrel, _ := a.store.ReleaseCount(ctx, repo.ID)
 				a.Alert(ctx, a.GoneAlertText(repo, st, nrel))
 			}
@@ -285,6 +289,7 @@ func (a *Archiver) finish(ctx context.Context, res Result, log zerolog.Logger) R
 		if repo.Upstream != "" {
 			_ = a.store.SetUpstream(ctx, repo.ID, "", "")
 			_ = a.store.AddEvent(ctx, repo.ID, store.EventRecovered, "back upstream")
+			a.Live.Event(repo.ID, repo.URL, "recovered", "Reachable upstream again")
 			a.Notify(ctx, fmt.Sprintf("♻️ **#%d** %s is reachable upstream again.", repo.ID, repo.URL))
 		} else if wasFailing {
 			_ = a.store.AddEvent(ctx, repo.ID, store.EventRecovered, "recovered")
@@ -312,6 +317,14 @@ func (a *Archiver) finish(ctx context.Context, res Result, log zerolog.Logger) R
 			}
 		}
 		a.updateMeta(ctx, res, true, log)
+		switch {
+		case !res.Change.Empty() || res.Cloned:
+			a.Live.Event(repo.ID, repo.URL, "change", res.Text())
+		case len(res.NewReleases) > 0:
+			a.Live.Event(repo.ID, repo.URL, "release", res.Text())
+		case len(res.PrunedReleases) > 0:
+			a.Live.Event(repo.ID, repo.URL, "prune", res.Text())
+		}
 		if text := RewriteNoticeText(repo, res.Change, res.branch); text != "" {
 			a.Notify(ctx, text)
 		}
@@ -332,6 +345,7 @@ func (a *Archiver) probeUpstream(ctx context.Context, res Result) forge.RepoStat
 	u := res.url
 	pctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
+	live.From(ctx).SetStep("Checking upstream", "")
 	st := a.forge.Probe(pctx, a.provider(pctx, u.Host), u.Owner, u.Name, "https://"+u.Host+"/"+u.Path)
 	if st.State == forge.Unknown {
 		if g := forge.ClassifyGitError(res.Err.Error()); g.State != forge.Unknown {
@@ -434,6 +448,8 @@ func (a *Archiver) archiveReleases(ctx context.Context, repo *store.Repo, u gito
 	if p == nil {
 		return nil, nil, nil
 	}
+	slot := live.From(ctx)
+	slot.SetStep("Listing releases", "")
 	rels, err := p.ListReleases(ctx, u.Owner, u.Name)
 	if errors.Is(err, forge.ErrNoRepo) {
 		return nil, nil, nil
@@ -456,9 +472,10 @@ func (a *Archiver) archiveReleases(ctx context.Context, repo *store.Repo, u gito
 			break
 		}
 		rel := *c.Release
-		a.setActivity(repo.ID, fmt.Sprintf("archiving releases (%d/%d: %s)", i+1, len(todo), rel.Tag))
+		label := fmt.Sprintf("%s (%d/%d)", rel.Tag, i+1, len(todo))
+		slot.SetStep("Archiving release", label)
 		dir := filepath.Join(a.releasesDir(repo), forge.SafeName(rel.Tag))
-		complete, skipped, err := a.saveRelease(ctx, rel, dir)
+		complete, skipped, err := a.saveRelease(ctx, rel, dir, label)
 		if err != nil {
 			log.Warn().Err(err).Str("tag", rel.Tag).Msg("Failed to archive release")
 			warnings = append(warnings, fmt.Sprintf("release %s: %s", rel.Tag, oneLine(err.Error())))
@@ -475,6 +492,7 @@ func (a *Archiver) archiveReleases(ctx context.Context, repo *store.Repo, u gito
 	}
 	if a.cfg.Releases.Limited() && ctx.Err() == nil {
 		// Re-plan with the real sizes now on disk and remove what no longer fits.
+		slot.SetStep("Applying release limits", "")
 		pruned, err = a.pruneReleases(ctx, repo, rels, log)
 		if err != nil {
 			warnings = append(warnings, "pruning releases: "+oneLine(err.Error()))
@@ -484,7 +502,7 @@ func (a *Archiver) archiveReleases(ctx context.Context, repo *store.Repo, u gito
 	return newTags, pruned, warnings
 }
 
-func (a *Archiver) saveRelease(ctx context.Context, rel forge.Release, dir string) (complete bool, skipped []string, err error) {
+func (a *Archiver) saveRelease(ctx context.Context, rel forge.Release, dir, label string) (complete bool, skipped []string, err error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return false, nil, err
 	}
@@ -510,7 +528,8 @@ func (a *Archiver) saveRelease(ctx context.Context, rel forge.Release, dir strin
 	}
 	complete = true
 	var firstErr error
-	for _, asset := range rel.Assets {
+	for i, asset := range rel.Assets {
+		live.From(ctx).SetStep("Downloading release", fmt.Sprintf("%s · asset %d/%d: %s", label, i+1, len(rel.Assets), asset.Name))
 		_, err := a.forge.Download(ctx, asset, filepath.Join(dir, "assets"), a.cfg.Releases.MaxAssetSize)
 		switch {
 		case err == nil:
@@ -545,8 +564,20 @@ func (a *Archiver) RunCycle(ctx context.Context) (results []Result, ran bool) {
 	for i, r := range repos {
 		ids[i] = r.ID
 	}
-	results = a.CheckMany(ctx, ids)
+	a.Live.CycleStart(len(ids))
+	a.Live.Event(0, "", "info", fmt.Sprintf("Check cycle started (%d repositories)", len(ids)))
+	results = a.checkMany(ctx, ids, true)
 	took := time.Since(start)
+	a.Live.CycleEnd()
+	changed, failed := 0, 0
+	for _, r := range results {
+		if r.Err != nil {
+			failed++
+		} else if r.Changed() {
+			changed++
+		}
+	}
+	a.Live.Event(0, "", "info", fmt.Sprintf("Check cycle finished in %s: %d changed, %d failed", took.Round(time.Second), changed, failed))
 	a.lastCycleEnd.Store(time.Now().Unix())
 	a.lastCycleDur.Store(took.Milliseconds())
 	a.log.Info().Int("repos", len(results)).Dur("took", took).Msg("Check cycle finished")
@@ -556,23 +587,39 @@ func (a *Archiver) RunCycle(ctx context.Context) (results []Result, ran bool) {
 
 // CheckMany checks the given repositories with bounded concurrency.
 func (a *Archiver) CheckMany(ctx context.Context, ids []int64) (results []Result) {
+	return a.checkMany(ctx, ids, false)
+}
+
+// checkMany runs the checks; cycle checks report on the hub's worker slots and progress.
+func (a *Archiver) checkMany(ctx context.Context, ids []int64, cycle bool) (results []Result) {
 	jobs := make(chan int64)
 	out := make(chan Result)
 	var wg sync.WaitGroup
 	for i := 0; i < a.cfg.Concurrency; i++ {
 		wg.Add(1)
+		wctx := ctx
+		if cycle {
+			wctx = live.WithSlot(ctx, a.Live.Worker(i))
+		}
 		go func() {
 			defer wg.Done()
+			ctx := wctx
 			for id := range jobs {
 				// A repo still busy with an earlier check (e.g. hours of release downloads
 				// after `add`) is skipped instead of holding up the whole cycle.
 				m := a.lock(id)
 				if !m.TryLock() {
 					a.log.Debug().Int64("repo_id", id).Msg("Skipping repository that is still being checked")
+					if cycle {
+						a.Live.CycleTick()
+					}
 					continue
 				}
 				res := a.check(ctx, id)
 				m.Unlock()
+				if cycle {
+					a.Live.CycleTick()
+				}
 				out <- res
 			}
 		}()
@@ -607,6 +654,7 @@ func (a *Archiver) Run(ctx context.Context) {
 	ticker := time.NewTicker(a.cfg.CheckInterval)
 	defer ticker.Stop()
 	for {
+		a.Live.SetNext(time.Now().Add(a.cfg.CheckInterval))
 		a.RunCycle(ctx)
 		select {
 		case <-ticker.C:

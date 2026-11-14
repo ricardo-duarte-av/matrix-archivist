@@ -36,6 +36,7 @@ func TestTakedownAlert(t *testing.T) {
 	defer st.Close()
 	cfg, err := config.Parse([]byte(fmt.Sprintf(`
 matrix: {homeserver: "https://m.example.org", user_id: "@b:example.org", password: x, room_id: "!r:example.org", pickle_key: k}
+allow_internal_hosts: true # fake forge on 127.0.0.1
 storage_dir: %s
 git_timeout: 20s
 failure_alert_threshold: 3
@@ -129,6 +130,7 @@ func TestBusyRepoSkipped(t *testing.T) {
 	defer st.Close()
 	cfg, _ := config.Parse([]byte(`
 matrix: {homeserver: "https://m.example.org", user_id: "@b:example.org", password: x, room_id: "!r:example.org", pickle_key: k}
+allow_internal_hosts: true # fake forge on 127.0.0.1
 storage_dir: ` + filepath.Join(tmp, "repos") + `
 releases: {enabled: false}
 `))
@@ -137,9 +139,11 @@ releases: {enabled: false}
 	r, _ := st.AddRepo(ctx, "https://git.invalid/o/r", "git.invalid/o/r", "git.invalid/o/r", "@u:x")
 	m := a.lock(r.ID)
 	m.Lock()
-	a.setActivity(r.ID, "archiving releases (3/40: v1)")
+	slot := a.Live.Temp("Manual check")
+	slot.Begin(r.ID, r.URL, "")
+	slot.SetStep("Archiving release", "v1 (3/40)")
 	a.Annotate(r)
-	if r.Activity != "archiving releases (3/40: v1)" || r.ActivitySince.IsZero() {
+	if r.Activity != "Archiving release: v1 (3/40)" || r.ActivitySince.IsZero() {
 		t.Errorf("activity: %+v", r)
 	}
 	done := make(chan []Result)
@@ -153,4 +157,9 @@ releases: {enabled: false}
 		t.Fatal("cycle blocked on a busy repo")
 	}
 	m.Unlock()
+	slot.End()
+	a.Annotate(r)
+	if r.Activity != "" {
+		t.Errorf("activity after end: %q", r.Activity)
+	}
 }

@@ -306,8 +306,31 @@ func TestExportImport(t *testing.T) {
 }
 
 func TestWidgetContent(t *testing.T) {
-	c := WidgetContent("https://archive.example.org", "Archive", "@archivist:example.org")
-	if c["url"] != "https://archive.example.org/browse/" || c["type"] != "m.custom" || c["id"] != widgetID {
+	c := WidgetContent(activityWidgetID, "https://archive.example.org/live/", "Archive activity", "t", "@archivist:example.org")
+	if c["url"] != "https://archive.example.org/live/" || c["type"] != "m.custom" || c["id"] != activityWidgetID {
 		t.Errorf("widget: %v", c)
+	}
+}
+
+func TestLayout(t *testing.T) {
+	order := []string{widgetID, activityWidgetID}
+	other := map[string]any{"container": "right"}
+	cur := map[string]any{"widgets": map[string]any{"someone-elses": other}}
+
+	l, changed := Layout(cur, map[string]bool{widgetID: true, activityWidgetID: true}, order)
+	ws := l["widgets"].(map[string]any)
+	if !changed || ws["someone-elses"] == nil || ws[widgetID].(map[string]any)["width"] != 50 || ws[activityWidgetID].(map[string]any)["index"] != 1 {
+		t.Fatalf("both pinned: %v", l)
+	}
+	if _, changed := Layout(l, map[string]bool{widgetID: true, activityWidgetID: true}, order); changed {
+		t.Error("no-op layout reported a change")
+	}
+	l, changed = Layout(l, map[string]bool{widgetID: true}, order)
+	ws = l["widgets"].(map[string]any)
+	if !changed || ws[activityWidgetID] != nil || ws[widgetID].(map[string]any)["width"] != 100 {
+		t.Fatalf("unpin one: %v", l)
+	}
+	if _, changed := Layout(nil, map[string]bool{}, order); changed {
+		t.Error("nothing pinned, nothing to change")
 	}
 }

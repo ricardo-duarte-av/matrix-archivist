@@ -97,6 +97,7 @@ func TestReleaseRetention(t *testing.T) {
 	cfgFor := func(keep int, max string) *config.Config {
 		cfg, err := config.Parse([]byte(fmt.Sprintf(`
 matrix: {homeserver: "https://m.example.org", user_id: "@b:example.org", password: x, room_id: "!r:example.org", pickle_key: k}
+allow_internal_hosts: true # fake forge on 127.0.0.1
 storage_dir: %s
 releases: {keep_last: %d, max_repo_size: %q}
 forges: [{host: git.invalid, type: github, api_url: %q}]

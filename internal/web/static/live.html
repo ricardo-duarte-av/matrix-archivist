@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Archive activity · Archivist</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/live.css">
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<script src="/static/live.js" defer></script>
+</head>
+<body>
+<header>
+  <div class="crumbs">Archive activity <span id="conn" class="conn" title="Connecting…">connecting</span></div>
+  <a class="button secondary" href="/browse/">Browse archive</a>
+</header>
+<main>
+  <section class="status" aria-live="polite">
+    <div id="cycle" class="cycle">…</div>
+    <div class="bar"><div id="cyclebar" class="fill"></div></div>
+    <div id="disk" class="disk"></div>
+  </section>
+  <section id="slots" class="slots" aria-label="Workers"></section>
+  <h2 class="feedtitle">Recent activity</h2>
+  <ol id="feed" class="feed" aria-live="polite"></ol>
+  <p id="nofeed" class="muted">Nothing has happened since the bot started.</p>
+</main>
+</body>
+</html>

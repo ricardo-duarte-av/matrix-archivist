@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
+	"strings"
 	"testing"
 )
 
@@ -42,5 +44,28 @@ func TestInfo(t *testing.T) {
 	p, _ := c.New("github", "h", srv.URL+"/gh", "")
 	if _, err := c.Info(context.Background(), p, "o", "missing"); err == nil {
 		t.Error("missing repo should fail")
+	}
+}
+
+func TestBlockInternal(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `{}`) }))
+	defer srv.Close()
+	c := NewClient()
+	c.BlockInternal()
+	p, _ := c.New("github", "h", srv.URL, "")
+	if _, err := c.Info(context.Background(), p, "o", "r"); err == nil || !strings.Contains(err.Error(), "internal address") {
+		t.Errorf("connection to 127.0.0.1 not refused: %v", err)
+	}
+	// A redirect from a public URL to an internal one is refused at dial time too; here we
+	// just check the classifier.
+	for _, a := range []string{"10.1.2.3", "192.168.0.1", "169.254.169.254", "::1", "fd00::1", "100.64.0.1", "::ffff:127.0.0.1"} {
+		if !IsInternal(netip.MustParseAddr(a)) {
+			t.Errorf("%s should be internal", a)
+		}
+	}
+	for _, a := range []string{"140.82.121.3", "2606:4700::1"} {
+		if IsInternal(netip.MustParseAddr(a)) {
+			t.Errorf("%s should be public", a)
+		}
 	}
 }

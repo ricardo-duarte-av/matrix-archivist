@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/ricardo-duarte-av/matrix-archivist/internal/live"
 )
 
 // Refs maps ref names (refs/heads/main, refs/tags/v1) to object IDs.
@@ -110,6 +112,25 @@ func (g *Git) run(ctx context.Context, dir string, args ...string) (string, erro
 }
 
 func (g *Git) runInput(ctx context.Context, dir, stdin string, args ...string) (string, error) {
+	return g.exec(ctx, dir, stdin, nil, args...)
+}
+
+// runProgress runs a clone/fetch with --progress and reports its progress to the live slot
+// attached to ctx (if any).
+func (g *Git) runProgress(ctx context.Context, dir string, args ...string) (string, error) {
+	slot := live.From(ctx)
+	if slot == nil {
+		return g.exec(ctx, dir, "", nil, args...)
+	}
+	return g.exec(ctx, dir, "", func(line string) {
+		if p, ok := ParseProgress(line); ok {
+			slot.SetDetail(p.Text())
+			slot.Progress(p.Done, p.Total, "objects")
+		}
+	}, args...)
+}
+
+func (g *Git) exec(ctx context.Context, dir, stdin string, onProgress func(string), args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, g.Binary, args...)
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
@@ -129,6 +150,9 @@ func (g *Git) runInput(ctx context.Context, dir, stdin string, args ...string) (
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+	if onProgress != nil {
+		cmd.Stderr = &progressWriter{onLine: onProgress, rest: &stderr}
+	}
 	err := cmd.Run()
 	if err != nil {
 		if ctx.Err() != nil {
@@ -173,8 +197,8 @@ func (g *Git) CloneMirror(ctx context.Context, remoteURL, dir string) error {
 	}
 	tmp := dir + ".tmp"
 	_ = os.RemoveAll(tmp)
-	args := append(g.remoteSafety(), "clone", "--bare", "--quiet", "--", remoteURL, tmp)
-	if _, err := g.run(ctx, "", args...); err != nil {
+	args := append(g.remoteSafety(), "clone", "--bare", "--progress", "--", remoteURL, tmp)
+	if _, err := g.runProgress(ctx, "", args...); err != nil {
 		_ = os.RemoveAll(tmp)
 		return err
 	}
@@ -196,12 +220,12 @@ func (g *Git) CloneMirror(ctx context.Context, remoteURL, dir string) error {
 func (g *Git) FetchMirror(ctx context.Context, dir string, prune bool) error {
 	// No automatic gc during the fetch: objects that upstream dropped must still exist when
 	// PreserveRefs runs right after.
-	args := append(g.remoteSafety(), "-c", "gc.auto=0", "-c", "maintenance.auto=false", "fetch", "--quiet", "--force")
+	args := append(g.remoteSafety(), "-c", "gc.auto=0", "-c", "maintenance.auto=false", "fetch", "--progress", "--force")
 	if prune {
 		args = append(args, "--prune", "--prune-tags")
 	}
 	args = append(args, "origin")
-	if _, err := g.run(ctx, dir, args...); err != nil {
+	if _, err := g.runProgress(ctx, dir, args...); err != nil {
 		return err
 	}
 	// Best effort: track upstream default branch.

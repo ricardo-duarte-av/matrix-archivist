@@ -110,10 +110,12 @@ When `http.enabled` is true, the bot serves a read-only browser for `storage_dir
 | `/browse/<path>/` | Folder listing |
 | `/download/<path>` | Download one file. Supports resume (HTTP Range). |
 | `/zip/<path>` | Download a folder as a zip. It is built on the fly, so no temp files are written. |
+| `/live/` | Live activity page (see below). |
 | `/healthz` | Liveness check, used by the Docker `HEALTHCHECK`. |
 
 - **Static files:** the CSS, icons and template are compiled into the binary, so the container needs nothing extra.
 - **Safe paths:** requests can't escape `storage_dir`. That includes `..` paths and symlinks pointing outside it.
+- **Symlinks and git config:** symlinks are never followed, even ones that stay inside `storage_dir`, because an archived repo could plant one pointing at another repo's files. They don't appear in listings or zips. Git `config` files (`mirror.git/config`, `checkout/.git/config`) are never served either: they can contain a token from a `https://user:token@…` clone URL.
 - **Access:** there is no login by default. Set `http.username`/`http.password` for basic auth, or put the browser behind a reverse proxy that adds TLS and auth.
 - **Links in the room:** with `http.public_url` set, `!archivist status` includes "Browse" links.
 - **Changing the port:** keep the container side of the compose port mapping in step with `http.port`. The healthcheck reads the port from the config.
@@ -126,6 +128,19 @@ With `http.widget.enabled` (default) and `http.public_url` set, the bot adds the
 - **Unsupported clients:** clients without widget support, gomuks for example, simply ignore it.
 - **Basic auth:** browsers often won't show a login prompt inside an embedded frame. With basic auth on, open the browser in a tab once (the session is then remembered), or use a reverse proxy with cookie-based auth.
 - **Removing it:** set `http.widget.enabled: false`. The bot removes the widget at its next start.
+
+### Live activity
+
+`/live/` shows what the bot is doing right now, without posting anything to the room. The page updates itself through a Server-Sent Events stream at `/live/events`.
+
+- **Status bar:** the check cycle ("checking 23 of 73", or idle with the time to the next cycle) and free disk space.
+- **One card per worker** (`concurrency`), plus temporary cards for checks started by `add`, `refresh` and `import`. Each card shows the repository and its description, the current step (cloning, fetching, updating the checkout, listing releases, downloading a release, reading the README, fetching the description, applying release limits), and a progress bar where there is real progress: git's object count while cloning or fetching, and bytes, speed and time left while downloading release assets.
+- **Recent activity:** the last 200 events, such as new commits, archived or removed releases, failures, and repos gone upstream or back.
+
+With `http.public_url` set, the page is added to the room as a second widget, "Archive activity" (`http.activity_widget`). Set `pin: true` on both widgets to show them side by side at the top of the room. Turn the page off with `http.live: false`.
+
+- **Reverse proxies:** the stream must not be buffered. The bot sends `X-Accel-Buffering: no`, which nginx honours. For other proxies, turn buffering off for `/live/events`.
+- **Connection limit:** at most 32 viewers at a time.
 
 ## Running with Docker Compose
 
@@ -175,11 +190,12 @@ See [`config.example.yaml`](config.example.yaml); every option is commented ther
 | `min_power_level` | Power level needed for add, remove and refresh. |
 | `check_interval` | How often every repository is checked. |
 | `summary.time` / `summary.timezone` | When the daily summary is posted. |
+| `allow_internal_hosts` | Let forge API calls and release downloads reach internal addresses (default `false`). |
 | `releases.*` | Release archiving, asset downloads, per-asset size cap, prereleases, retention (`keep_last`, `max_repo_size`). |
 | `forges` | API tokens and self-hosted forges. A GitHub token is strongly recommended: without one the API allows 60 requests/hour. |
 | `prune_deleted` | Whether branches and tags deleted upstream are deleted from the archive too. Default `false`: they are kept. Either way they're snapshotted under `refs/archive/` first. |
 | `disk_warn_free` | @room alert when free space in `storage_dir` drops below this (default `5GB`). A notice follows when it recovers. |
-| `http.metrics`, `http.widget.*` | Prometheus endpoint, and the room widget. |
+| `http.metrics`, `http.widget.*`, `http.live`, `http.activity_widget.*` | Prometheus endpoint, the file-browser widget, the live activity page and its widget. |
 
 ## Failure alerts
 

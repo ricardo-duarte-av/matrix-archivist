@@ -1,6 +1,7 @@
 package gitops
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"os/exec"
@@ -18,6 +19,8 @@ func TestParseRepoURL(t *testing.T) {
 		{"ssh://git@gitlab.com:2222/group/sub/project.git", "gitlab.com/group/sub/project", "group/sub", "project"},
 		{"git://git.kernel.org/pub/scm/git/git.git", "git.kernel.org/pub/scm/git/git", "pub/scm/git", "git"},
 		{"<https://codeberg.org/forgejo/forgejo>", "codeberg.org/forgejo/forgejo", "forgejo", "forgejo"},
+		{"https://140.82.121.3/o/r", "140.82.121.3/o/r", "o", "r"}, // public IP
+		{"https://git.192.168.example.org/o/r", "git.192.168.example.org/o/r", "o", "r"},
 	}
 	for _, c := range ok {
 		u, err := ParseRepoURL(c.in)
@@ -35,6 +38,11 @@ func TestParseRepoURL(t *testing.T) {
 		"https://localhost/a/b", "https://github.com/", "https://github.com/a/../b",
 		"ext::sh -c touch% /tmp/pwned", "https://github.com/a/b?x=1",
 		"https://gitlab.com/a/b/-/tree/main", "ftp://example.com/a",
+		// Internal networks and numeric tricks.
+		"https://127.0.0.1/a/b", "https://10.0.0.5/a/b", "http://192.168.1.10/a/b", "https://172.16.3.4/a/b",
+		"https://169.254.169.254/latest/meta-data", "https://100.64.1.1/a/b", "https://0.0.0.0/a/b",
+		"https://127.1/a/b", "https://0x7f.0.0.1/a/b", "https://017.0.0.1/a/b", "git@10.1.2.3:a/b",
+		"https://foo.localhost/a/b",
 	}
 	for _, in := range bad {
 		if _, err := ParseRepoURL(in); err == nil {
@@ -211,5 +219,23 @@ func TestRemoteSafetyBlocksLocal(t *testing.T) {
 	g := New()
 	if err := g.CloneMirror(context.Background(), filepath.Join(tmp, "up.git"), filepath.Join(tmp, "m.git")); err == nil {
 		t.Fatal("expected local clone to be blocked")
+	}
+}
+
+func TestProgress(t *testing.T) {
+	p, ok := ParseProgress("Receiving objects:  45% (1234/2700), 12.00 MiB | 3.00 MiB/s")
+	if !ok || p.Done != 1234 || p.Total != 2700 || p.Text() != "Receiving objects 45% · 12.00 MiB · 3.00 MiB/s" {
+		t.Errorf("%+v %q", p, p.Text())
+	}
+	if p, ok := ParseProgress("remote: Compressing objects:  10% (1/10)"); !ok || p.Phase != "Compressing objects" {
+		t.Errorf("remote: %+v", p)
+	}
+	var rest bytes.Buffer
+	var got []string
+	w := &progressWriter{onLine: func(l string) { got = append(got, l) }, rest: &rest}
+	w.Write([]byte("Cloning into bare repository '/data/x'...\nremote: Enumerating objects: 5, done.\nReceiving objects:  50% (1/2)\rReceiving obj"))
+	w.Write([]byte("ects: 100% (2/2), done.\nfatal: repository not found\n"))
+	if len(got) != 2 || rest.String() != "fatal: repository not found\n" {
+		t.Errorf("progress %q, rest %q", got, rest.String())
 	}
 }

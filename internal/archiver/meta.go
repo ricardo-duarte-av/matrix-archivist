@@ -6,6 +6,7 @@ import (
 
 	"github.com/rs/zerolog"
 
+	"github.com/ricardo-duarte-av/matrix-archivist/internal/live"
 	"github.com/ricardo-duarte-av/matrix-archivist/internal/readme"
 	"github.com/ricardo-duarte-av/matrix-archivist/internal/store"
 )
@@ -19,6 +20,7 @@ const forgeInfoMaxAge = 24 * time.Hour
 func (a *Archiver) updateMeta(ctx context.Context, res Result, askForge bool, log zerolog.Logger) {
 	repo := res.Repo
 	if (res.Changed() || repo.ReadmeAt.IsZero()) && dirExists(a.checkoutDir(repo)) {
+		live.From(ctx).SetStep("Reading README", "")
 		info, _ := readme.Read(a.checkoutDir(repo))
 		if err := a.store.SetReadme(ctx, repo.ID, store.Readme{
 			Title: info.Title, Summary: info.Summary, Links: info.Links, Text: info.Text,
@@ -34,6 +36,7 @@ func (a *Archiver) updateMeta(ctx context.Context, res Result, askForge bool, lo
 		_ = a.store.SetForgeInfo(ctx, repo.ID, "", "", nil, false)
 		return
 	}
+	live.From(ctx).SetStep("Fetching description", res.url.Host)
 	ictx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 	info, err := a.forge.Info(ictx, p, res.url.Owner, res.url.Name)

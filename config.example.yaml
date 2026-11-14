@@ -41,6 +41,10 @@ failure_alert_threshold: 5
 prune_deleted: false
 # Post an @room alert when free space in storage_dir drops below this (0 = off).
 disk_warn_free: 5GB
+# Forge APIs and release downloads may not connect to internal addresses (127.0.0.1, 10.x,
+# 192.168.x, 169.254.x, …), so a forge can't make the bot fetch and publish internal pages.
+# Set to true if one of your forges runs on your own network.
+allow_internal_hosts: false
 log_level: info           # debug, info, warn, error
 
 summary:
@@ -79,6 +83,14 @@ http:
     enabled: true
     name: Archive
     pin: false            # true = show it at the top of the room for everyone
+  # Live activity page at /live/: what each worker is doing right now, with progress bars,
+  # and a feed of recent events. Updates itself; nothing is posted to the room.
+  live: true
+  # Adds the live page to the room as a second widget (needs public_url).
+  activity_widget:
+    enabled: true
+    name: Archive activity
+    pin: false            # both widgets pinned = side by side at the top
 
 # Release APIs. github.com, gitlab.com, codeberg.org and a few other well-known hosts are detected
 # automatically, and unknown hosts are probed for a Gitea/Forgejo or GitLab API.

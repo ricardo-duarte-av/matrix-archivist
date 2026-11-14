@@ -3,6 +3,7 @@ package gitops
 import (
 	"errors"
 	"fmt"
+	"net/netip"
 	"net/url"
 	"path"
 	"regexp"
@@ -28,6 +29,27 @@ func (r RepoURL) Key() string {
 func (r RepoURL) RelDir() string {
 	return path.Join(r.Host, r.Path)
 }
+
+// checkIPHost rejects IP-address hosts on internal networks (the bot would otherwise probe
+// them on behalf of whoever adds the URL) and odd numeric forms like 0x7f.1 that git/curl
+// may read as an IP.
+func checkIPHost(host string) error {
+	last := host[strings.LastIndexByte(host, '.')+1:]
+	if strings.Trim(last, "0123456789") != "" {
+		return nil // ends in a name label: a hostname
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return fmt.Errorf("host %q is not a valid hostname or IP address", host)
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() ||
+		ip.IsMulticast() || ip.IsLinkLocalMulticast() || cgnat.Contains(ip) {
+		return fmt.Errorf("host %q is on an internal network", host)
+	}
+	return nil
+}
+
+var cgnat = netip.MustParsePrefix("100.64.0.0/10")
 
 var (
 	scpLike     = regexp.MustCompile(`^([A-Za-z0-9._-]+)@([A-Za-z0-9.-]+):(.+)$`)
@@ -79,8 +101,11 @@ func ParseRepoURL(raw string) (RepoURL, error) {
 	if !safeHost.MatchString(host) {
 		return RepoURL{}, fmt.Errorf("invalid host %q", host)
 	}
-	if host == "localhost" || !strings.Contains(host, ".") {
+	if host == "localhost" || !strings.Contains(host, ".") || strings.HasSuffix(host, ".localhost") {
 		return RepoURL{}, fmt.Errorf("host %q is not allowed", host)
+	}
+	if err := checkIPHost(host); err != nil {
+		return RepoURL{}, err
 	}
 
 	p = strings.Trim(p, "/")

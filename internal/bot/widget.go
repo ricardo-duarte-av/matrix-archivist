@@ -5,6 +5,8 @@ import (
 	"maps"
 
 	"maunium.net/go/mautrix/event"
+
+	"github.com/ricardo-duarte-av/matrix-archivist/internal/config"
 )
 
 var (
@@ -12,73 +14,117 @@ var (
 	layoutEventType = event.Type{Type: "io.element.widgets.layout", Class: event.StateEventType}
 )
 
-const widgetID = "archivist"
+// roomWidget is one of the bot's widgets.
+type roomWidget struct {
+	id, path, title string
+	want            bool
+	cfg             config.Widget
+}
 
-// WidgetContent is the room widget pointing at the file browser.
-func WidgetContent(publicURL, name, creator string) map[string]any {
+const (
+	widgetID         = "archivist"
+	activityWidgetID = "archivist-activity"
+)
+
+// WidgetContent is the state content of a room widget pointing at publicURL+path.
+func WidgetContent(id, url, name, title, creator string) map[string]any {
 	return map[string]any{
-		"id":                widgetID,
+		"id":                id,
 		"type":              "m.custom",
-		"url":               publicURL + "/browse/",
+		"url":               url,
 		"name":              name,
 		"creatorUserId":     creator,
 		"waitForIframeLoad": true,
-		"data":              map[string]any{"title": "Repository archive"},
+		"data":              map[string]any{"title": title},
 	}
 }
 
-// syncWidget adds, updates or removes the file-browser widget according to the config.
-// It only sends state events when something actually changes.
+func (b *Bot) widgets() []roomWidget {
+	h := b.cfg.HTTP
+	ok := h.Enabled && h.PublicURL != ""
+	return []roomWidget{
+		{widgetID, "/browse/", "Repository archive", ok && h.Widget.Enabled, h.Widget},
+		{activityWidgetID, "/live/", "What the archivist is doing", ok && h.Live && h.ActivityWidget.Enabled, h.ActivityWidget},
+	}
+}
+
+// syncWidget adds, updates or removes the bot's widgets according to the config. It only
+// sends state events when something actually changes.
 func (b *Bot) syncWidget(ctx context.Context) {
 	h := b.cfg.HTTP
-	want := h.Enabled && h.Widget.Enabled && h.PublicURL != ""
-	if h.Enabled && h.Widget.Enabled && h.PublicURL == "" {
-		b.log.Warn().Msg("http.widget is enabled but http.public_url is not set; not adding the widget")
+	if h.Enabled && (h.Widget.Enabled || h.ActivityWidget.Enabled) && h.PublicURL == "" {
+		b.log.Warn().Msg("http.widget / http.activity_widget are enabled but http.public_url is not set; not adding widgets")
 	}
-
-	var current map[string]any
-	_ = b.client.StateEvent(ctx, b.roomID, widgetEventType, widgetID, &current)
-	exists := current["url"] != nil && current["url"] != ""
-
-	if want {
-		content := WidgetContent(h.PublicURL, h.Widget.Name, b.client.UserID.String())
-		if !exists || current["url"] != content["url"] || current["name"] != content["name"] {
-			if _, err := b.client.SendStateEvent(ctx, b.roomID, widgetEventType, widgetID, content); err != nil {
-				b.log.Warn().Err(err).Msg("Failed to add room widget (the bot needs permission to change widgets)")
-				return
-			}
-			b.log.Info().Str("url", content["url"].(string)).Msg("Room widget added")
-		}
-	} else if exists {
-		if _, err := b.client.SendStateEvent(ctx, b.roomID, widgetEventType, widgetID, map[string]any{}); err != nil {
-			b.log.Warn().Err(err).Msg("Failed to remove room widget")
-		} else {
-			b.log.Info().Msg("Room widget removed")
-		}
+	pins := map[string]bool{}
+	for _, w := range b.widgets() {
+		b.syncOneWidget(ctx, w)
+		pins[w.id] = w.want && w.cfg.Pin
 	}
-	b.syncLayout(ctx, want && h.Widget.Pin)
+	b.syncLayout(ctx, pins)
 }
 
-// syncLayout pins the widget to the top of the room (Element's layout state), keeping the
-// layout of any other widgets.
-func (b *Bot) syncLayout(ctx context.Context, pin bool) {
-	var layout map[string]any
-	_ = b.client.StateEvent(ctx, b.roomID, layoutEventType, "", &layout)
-	widgets, _ := layout["widgets"].(map[string]any)
-	_, pinned := widgets[widgetID]
-	if pin == pinned {
-		return
+func (b *Bot) syncOneWidget(ctx context.Context, w roomWidget) {
+	var current map[string]any
+	_ = b.client.StateEvent(ctx, b.roomID, widgetEventType, w.id, &current)
+	exists := current["url"] != nil && current["url"] != ""
+	if w.want {
+		content := WidgetContent(w.id, b.cfg.HTTP.PublicURL+w.path, w.cfg.Name, w.title, b.client.UserID.String())
+		if !exists || current["url"] != content["url"] || current["name"] != content["name"] {
+			if _, err := b.client.SendStateEvent(ctx, b.roomID, widgetEventType, w.id, content); err != nil {
+				b.log.Warn().Err(err).Str("widget", w.id).Msg("Failed to add room widget (the bot needs permission to change widgets)")
+				return
+			}
+			b.log.Info().Str("widget", w.id).Str("url", content["url"].(string)).Msg("Room widget added")
+		}
+	} else if exists {
+		if _, err := b.client.SendStateEvent(ctx, b.roomID, widgetEventType, w.id, map[string]any{}); err != nil {
+			b.log.Warn().Err(err).Str("widget", w.id).Msg("Failed to remove room widget")
+		} else {
+			b.log.Info().Str("widget", w.id).Msg("Room widget removed")
+		}
 	}
+}
+
+// Layout computes Element's widget layout: the bot's pinned widgets share the top container
+// side by side, and widgets that aren't the bot's keep their place.
+func Layout(current map[string]any, pins map[string]bool, order []string) (map[string]any, bool) {
+	widgets, _ := current["widgets"].(map[string]any)
 	newWidgets := map[string]any{}
 	maps.Copy(newWidgets, widgets)
-	if pin {
-		newWidgets[widgetID] = map[string]any{"container": "top", "index": 0, "width": 100, "height": 40}
-	} else {
-		delete(newWidgets, widgetID)
+	var pinned []string
+	for _, id := range order {
+		delete(newWidgets, id)
+		if pins[id] {
+			pinned = append(pinned, id)
+		}
 	}
-	newLayout := map[string]any{}
-	maps.Copy(newLayout, layout)
-	newLayout["widgets"] = newWidgets
+	for i, id := range pinned {
+		newWidgets[id] = map[string]any{"container": "top", "index": i, "width": 100 / len(pinned), "height": 40}
+	}
+	// Changed only if the set of pinned bot widgets differs (don't fight users resizing them).
+	changed := false
+	for _, id := range order {
+		_, was := widgets[id]
+		if was != pins[id] {
+			changed = true
+		}
+	}
+	if !changed {
+		return current, false
+	}
+	out := map[string]any{}
+	maps.Copy(out, current)
+	out["widgets"] = newWidgets
+	return out, true
+}
+
+func (b *Bot) syncLayout(ctx context.Context, pins map[string]bool) {
+	var layout map[string]any
+	_ = b.client.StateEvent(ctx, b.roomID, layoutEventType, "", &layout)
+	newLayout, changed := Layout(layout, pins, []string{widgetID, activityWidgetID})
+	if !changed {
+		return
+	}
 	if _, err := b.client.SendStateEvent(ctx, b.roomID, layoutEventType, "", newLayout); err != nil {
 		b.log.Warn().Err(err).Msg("Failed to update the room's widget layout")
 	}
