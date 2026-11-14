@@ -3,9 +3,10 @@ package bot
 import (
 	"errors"
 	"fmt"
-	"net/url"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"maunium.net/go/mautrix/event"
@@ -24,17 +25,27 @@ type command struct {
 
 var commands map[string]command
 
+var helpOrder = []string{"add", "remove", "list", "search", "info", "note", "tag", "untag", "refresh", "status", "usage", "summary", "export", "import", "help"}
+
 func init() {
 	commands = map[string]command{
 		"add":     {"add <url> [url…]", "Add git repositories to the archive", true, (*Bot).cmdAdd},
 		"remove":  {"remove <#id|url> [--purge]", "Stop tracking a repository (`--purge` also deletes its files)", true, (*Bot).cmdRemove},
-		"list":    {"list", "List tracked repositories", false, (*Bot).cmdList},
+		"list":    {"list [tag]", "List tracked repositories, optionally only those with a tag", false, (*Bot).cmdList},
+		"search":  {"search <text|#tag>…", "Search repositories by URL, note and tags", false, (*Bot).cmdSearch},
+		"info":    {"info <#id|url>", "Details about a repository: state, recent commits, releases, snapshots", false, (*Bot).cmdInfo},
+		"note":    {"note <#id> [text|--clear]", "Show, set or clear a note on a repository (why it is archived)", true, (*Bot).cmdNote},
+		"tag":     {"tag <#id> <tag>…", "Add tags to a repository", true, (*Bot).cmdTag},
+		"untag":   {"untag <#id> <tag>…", "Remove tags from a repository", true, (*Bot).cmdUntag},
 		"refresh": {"refresh <#id|url|all>", "Check a repository for updates now", true, (*Bot).cmdRefresh},
-		"status":  {"status [#id|url]", "Show overall or per-repository status", false, (*Bot).cmdStatus},
+		"status":  {"status [#id|url]", "Overall status (or details about one repository)", false, (*Bot).cmdStatus},
+		"usage":   {"usage", "Disk usage per repository and free space", false, (*Bot).cmdUsage},
 		"summary": {"summary", "Post the summary of changes since the last scheduled summary", false, (*Bot).cmdSummary},
+		"export":  {"export", "Upload the repository list (with notes and tags) as a JSON file", false, (*Bot).cmdExport},
+		"import":  {"import", "Reply to an exported file (or a text file of URLs) to add its repositories", true, (*Bot).cmdImport},
 		"help":    {"help", "Show this help", false, (*Bot).cmdHelp},
 	}
-	aliases := map[string]string{"rm": "remove", "del": "remove", "ls": "list", "update": "refresh", "pull": "refresh", "info": "status"}
+	aliases := map[string]string{"rm": "remove", "del": "remove", "ls": "list", "update": "refresh", "pull": "refresh", "find": "search", "du": "usage"}
 	for a, c := range aliases {
 		commands[a] = commands[c]
 	}
@@ -64,7 +75,7 @@ func (b *Bot) handle(evt *event.Event, args []string) {
 func (b *Bot) cmdHelp(evt *event.Event, _ []string) {
 	var sb strings.Builder
 	sb.WriteString("**Archivist commands**\n\n")
-	for _, name := range []string{"add", "remove", "list", "refresh", "status", "summary", "help"} {
+	for _, name := range helpOrder {
 		c := commands[name]
 		lock := ""
 		if c.privileged {
@@ -104,12 +115,25 @@ func (b *Bot) cmdAdd(evt *event.Event, args []string) {
 		}
 	}
 	b.reply(evt, strings.Join(lines, "\n"))
+	if len(added) == 0 {
+		return
+	}
+	done := b.progress(evt)
+	var wg sync.WaitGroup
+	var failed atomic.Bool
 	for _, repo := range added {
+		wg.Add(1)
 		go func(repo *store.Repo) {
+			defer wg.Done()
 			res := b.arch.Check(b.ctx, repo.ID)
+			if res.Err != nil {
+				failed.Store(true)
+			}
 			b.reply(evt, fmt.Sprintf("**#%d** %s: %s", repo.ID, repo.URL, res.Text()))
 		}(repo)
 	}
+	wg.Wait()
+	done(!failed.Load())
 }
 
 // resolve finds a repo by "#3", "3" or URL.
@@ -166,7 +190,7 @@ func (b *Bot) cmdRemove(evt *event.Event, args []string) {
 	b.reply(evt, strings.Join(lines, "\n"))
 }
 
-func (b *Bot) cmdList(evt *event.Event, _ []string) {
+func (b *Bot) cmdList(evt *event.Event, args []string) {
 	repos, err := b.store.Repos(b.ctx)
 	if err != nil {
 		b.reply(evt, "❌ "+err.Error())
@@ -176,22 +200,47 @@ func (b *Bot) cmdList(evt *event.Event, _ []string) {
 		b.reply(evt, fmt.Sprintf("No repositories tracked yet. Add one with `%s add <url>`.", b.cfg.CommandPrefix))
 		return
 	}
+	title := "Tracked repositories"
+	if len(args) > 0 {
+		tag := store.NormalizeTag(args[0])
+		repos = FilterRepos(repos, []string{"#" + tag})
+		title = fmt.Sprintf("Repositories tagged `%s`", tag)
+		if len(repos) == 0 {
+			b.reply(evt, fmt.Sprintf("No repositories are tagged `%s`.", tag))
+			return
+		}
+	}
 	const perMsg = 50
 	for i := 0; i < len(repos); i += perMsg {
 		end := min(i+perMsg, len(repos))
 		var sb strings.Builder
 		if i == 0 {
-			fmt.Fprintf(&sb, "**Tracked repositories (%d):**\n\n", len(repos))
+			fmt.Fprintf(&sb, "**%s (%d):**\n\n", title, len(repos))
 		}
 		for _, r := range repos[i:end] {
-			fmt.Fprintf(&sb, "- **#%d** %s — %s\n", r.ID, r.URL, repoState(r))
+			sb.WriteString(repoLine(r))
 		}
 		b.reply(evt, sb.String())
 	}
 }
 
+// repoLine is a list entry: "- **#3** url — state · `tag`\n".
+func repoLine(r *store.Repo) string {
+	line := fmt.Sprintf("- **#%d** %s — %s", r.ID, r.URL, repoState(r))
+	for _, t := range r.Tags {
+		line += " · `" + t + "`"
+	}
+	return line + "\n"
+}
+
 func repoState(r *store.Repo) string {
 	switch {
+	case r.Upstream == store.UpstreamLegal:
+		return fmt.Sprintf("⚖️ taken down upstream %s, archive preserved", ago(r.UpstreamSince))
+	case r.Upstream == store.UpstreamBlocked:
+		return fmt.Sprintf("🚫 blocked upstream %s, archive preserved", ago(r.UpstreamSince))
+	case r.Upstream != "":
+		return fmt.Sprintf("🪦 gone upstream %s, archive preserved", ago(r.UpstreamSince))
 	case r.FailCount > 0 && !r.Cloned:
 		return fmt.Sprintf("❌ clone failing (%d×)", r.FailCount)
 	case r.FailCount > 0:
@@ -226,12 +275,18 @@ func (b *Bot) cmdRefresh(evt *event.Event, args []string) {
 		return
 	}
 	if strings.EqualFold(args[0], "all") {
-		b.react(evt, "⏳")
+		done := b.progress(evt)
 		results, ran := b.arch.RunCycle(b.ctx)
 		if !ran {
+			done(true)
 			b.reply(evt, "A check cycle is already running; results will appear in the next summary.")
 			return
 		}
+		ok := true
+		for _, r := range results {
+			ok = ok && r.Err == nil
+		}
+		done(ok)
 		b.reply(evt, cycleReport(results))
 		return
 	}
@@ -245,12 +300,15 @@ func (b *Bot) cmdRefresh(evt *event.Event, args []string) {
 		}
 		repos = append(repos, r)
 	}
+	ok := len(lines) == 0
 	if len(repos) > 0 {
-		b.react(evt, "⏳")
-	}
-	for _, r := range repos {
-		res := b.arch.Check(b.ctx, r.ID)
-		lines = append(lines, fmt.Sprintf("- **#%d** %s: %s", r.ID, r.URL, res.Text()))
+		done := b.progress(evt)
+		for _, r := range repos {
+			res := b.arch.Check(b.ctx, r.ID)
+			ok = ok && res.Err == nil
+			lines = append(lines, fmt.Sprintf("- **#%d** %s: %s", r.ID, r.URL, res.Text()))
+		}
+		done(ok)
 	}
 	b.reply(evt, strings.Join(lines, "\n"))
 }
@@ -281,26 +339,7 @@ func cycleReport(results []archiver.Result) string {
 
 func (b *Bot) cmdStatus(evt *event.Event, args []string) {
 	if len(args) > 0 {
-		r, err := b.resolve(args[0])
-		if err != nil {
-			b.reply(evt, "❌ "+err.Error())
-			return
-		}
-		nrel, _ := b.store.ReleaseCount(b.ctx, r.ID)
-		var sb strings.Builder
-		fmt.Fprintf(&sb, "**#%d** %s\n\n", r.ID, r.URL)
-		fmt.Fprintf(&sb, "- State: %s\n", repoState(r))
-		fmt.Fprintf(&sb, "- Added by %s, %s\n", r.AddedBy, ago(r.AddedAt))
-		fmt.Fprintf(&sb, "- Last checked: %s · last changed: %s\n", ago(r.LastChecked), ago(r.LastChanged))
-		fmt.Fprintf(&sb, "- Releases archived: %d\n", nrel)
-		fmt.Fprintf(&sb, "- Disk usage: %s (`%s`)\n", gitops.HumanSize(gitops.DirSize(b.arch.RepoDir(r))), r.RelDir)
-		if u := b.browseURL(r.RelDir); u != "" {
-			fmt.Fprintf(&sb, "- Browse: %s\n", u)
-		}
-		if r.LastError != "" {
-			fmt.Fprintf(&sb, "- Last error: `%s`\n", strings.ReplaceAll(r.LastError, "`", "'"))
-		}
-		b.reply(evt, sb.String())
+		b.cmdInfo(evt, args)
 		return
 	}
 	repos, err := b.store.Repos(b.ctx)
@@ -308,18 +347,22 @@ func (b *Bot) cmdStatus(evt *event.Event, args []string) {
 		b.reply(evt, "❌ "+err.Error())
 		return
 	}
-	failing := 0
+	failing, gone := 0, 0
+	var used int64
 	for _, r := range repos {
-		if r.FailCount > 0 {
+		if r.Upstream != "" {
+			gone++
+		} else if r.FailCount > 0 {
 			failing++
 		}
+		used += r.SizeBytes
 	}
 	var sb strings.Builder
 	sb.WriteString("**Archivist status**\n\n")
-	fmt.Fprintf(&sb, "- Repositories: %d (%d failing)\n", len(repos), failing)
-	fmt.Fprintf(&sb, "- Storage used: %s\n", gitops.HumanSize(gitops.DirSize(b.cfg.StorageDir)))
+	fmt.Fprintf(&sb, "- Repositories: %d (%d failing, %d gone upstream)\n", len(repos), failing, gone)
+	fmt.Fprintf(&sb, "- Storage used: %s%s\n", gitops.HumanSize(used), freeSpaceText(b.cfg.StorageDir))
 	fmt.Fprintf(&sb, "- Check interval: %s\n", b.cfg.CheckInterval)
-	if u := b.browseURL(""); u != "" {
+	if u := b.cfg.HTTP.BrowseURL(""); u != "" {
 		fmt.Fprintf(&sb, "- Browse: %s\n", u)
 	}
 	if b.cfg.Summary.Enabled {
@@ -333,20 +376,4 @@ func (b *Bot) cmdStatus(evt *event.Event, args []string) {
 
 func (b *Bot) cmdSummary(_ *event.Event, _ []string) {
 	b.arch.PostSummary(b.ctx, false)
-}
-
-// browseURL returns the public file-browser URL for a storage-relative directory, or "".
-func (b *Bot) browseURL(relDir string) string {
-	h := b.cfg.HTTP
-	if !h.Enabled || h.PublicURL == "" {
-		return ""
-	}
-	if relDir == "" {
-		return h.PublicURL + "/browse/"
-	}
-	parts := strings.Split(relDir, "/")
-	for i, p := range parts {
-		parts[i] = url.PathEscape(p)
-	}
-	return h.PublicURL + "/browse/" + strings.Join(parts, "/") + "/"
 }

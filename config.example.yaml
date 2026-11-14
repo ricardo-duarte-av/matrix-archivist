@@ -23,7 +23,7 @@ matrix:
 command_prefix: "!archivist"
 
 # Minimum room power level for add / remove / refresh (0 = everyone, 50 = moderators, 100 = admins).
-# list / status / summary / help are open to everyone in the room.
+# add, remove, refresh, note, tag, untag and import need it; everything else is open to everyone.
 min_power_level: 50
 
 storage_dir: /data/repos
@@ -37,7 +37,12 @@ git_timeout: 30m          # per clone/fetch
 # The bot needs the room's "notify everyone" power level (default 50) for @room to ping.
 failure_alert_threshold: 5
 # Delete branches/tags locally when they are deleted upstream. false = keep them (safer for an archive).
+# Either way, anything upstream rewrites or deletes is first preserved under refs/archive/<time>/.
 prune_deleted: false
+# Post an @room alert when free space in storage_dir drops below this (0 = off).
+disk_warn_free: 5GB
+# Put long replies (list, info, search, …) in a thread on the command instead of the main timeline.
+thread_replies: true
 log_level: info           # debug, info, warn, error
 
 summary:
@@ -63,6 +68,14 @@ http:
   username: ""
   password: ""
   max_concurrent_zips: 2
+  # Prometheus metrics at /metrics (protected by the basic auth above, if set).
+  metrics: true
+  # Add the file browser to the room as a widget (Element / SchildiChat; needs public_url, and the
+  # bot needs permission to change widgets — Moderator by default).
+  widget:
+    enabled: true
+    name: Archive
+    pin: false            # true = show it at the top of the room for everyone
 
 # Release APIs. github.com, gitlab.com, codeberg.org and a few other well-known hosts are detected
 # automatically, and unknown hosts are probed for a Gitea/Forgejo or GitLab API.

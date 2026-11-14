@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Refs maps ref names (refs/heads/main, refs/tags/v1) to object IDs.
@@ -26,10 +27,23 @@ type Change struct {
 	NewTags         []string
 	DeletedTags     []string
 	NewCommits      int // commits reachable from updated/new branches that weren't before (approximate)
+
+	// RewrittenBranches were updated in a way that dropped commits (force push / history rewrite).
+	RewrittenBranches []string `json:",omitempty"`
+	// MovedTags point at a different object than before.
+	MovedTags []string `json:",omitempty"`
+	// Snapshot is the refs/archive/<stamp> namespace where the previous tips of rewritten,
+	// deleted or moved refs were preserved ("" if nothing needed preserving).
+	Snapshot string `json:",omitempty"`
 }
 
 func (c Change) Empty() bool {
-	return len(c.NewBranches)+len(c.UpdatedBranches)+len(c.DeletedBranches)+len(c.NewTags)+len(c.DeletedTags) == 0
+	return len(c.NewBranches)+len(c.UpdatedBranches)+len(c.DeletedBranches)+len(c.NewTags)+len(c.DeletedTags)+len(c.MovedTags) == 0
+}
+
+// Destructive reports whether upstream removed or rewrote anything.
+func (c Change) Destructive() bool {
+	return len(c.RewrittenBranches)+len(c.DeletedBranches)+len(c.MovedTags)+len(c.DeletedTags) > 0
 }
 
 // Summary is a short human-readable description, e.g. "12 commits, 2 new tags (v1.2, v1.3)".
@@ -52,6 +66,12 @@ func (c Change) Summary() string {
 	}
 	if n := len(c.DeletedTags); n > 0 {
 		parts = append(parts, plural(n, "tag deleted", "tags deleted"))
+	}
+	if n := len(c.RewrittenBranches); n > 0 {
+		parts = append(parts, fmt.Sprintf("⚠️ history rewritten on %s", abbrevList(c.RewrittenBranches, 5)))
+	}
+	if n := len(c.MovedTags); n > 0 {
+		parts = append(parts, fmt.Sprintf("⚠️ %s (%s)", plural(n, "tag moved", "tags moved"), abbrevList(c.MovedTags, 5)))
 	}
 	if len(parts) == 0 {
 		return "no changes"
@@ -86,7 +106,14 @@ type Git struct {
 func New() *Git { return &Git{Binary: "git"} }
 
 func (g *Git) run(ctx context.Context, dir string, args ...string) (string, error) {
+	return g.runInput(ctx, dir, "", args...)
+}
+
+func (g *Git) runInput(ctx context.Context, dir, stdin string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, g.Binary, args...)
+	if stdin != "" {
+		cmd.Stdin = strings.NewReader(stdin)
+	}
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(),
 		"GIT_TERMINAL_PROMPT=0",
@@ -164,7 +191,9 @@ func (g *Git) CloneMirror(ctx context.Context, remoteURL, dir string) error {
 // upstream are deleted locally too; without it they are kept (safer for archiving).
 // It also follows changes of the remote's default branch.
 func (g *Git) FetchMirror(ctx context.Context, dir string, prune bool) error {
-	args := append(g.remoteSafety(), "fetch", "--quiet", "--force")
+	// No automatic gc during the fetch: objects that upstream dropped must still exist when
+	// PreserveRefs runs right after.
+	args := append(g.remoteSafety(), "-c", "gc.auto=0", "-c", "maintenance.auto=false", "fetch", "--quiet", "--force")
 	if prune {
 		args = append(args, "--prune", "--prune-tags")
 	}
@@ -220,8 +249,11 @@ func (g *Git) Diff(ctx context.Context, dir string, before, after Refs) Change {
 				newTips = append(newTips, obj)
 			}
 		case strings.HasPrefix(name, "refs/tags/"):
+			short := strings.TrimPrefix(name, "refs/tags/")
 			if !existed {
-				c.NewTags = append(c.NewTags, strings.TrimPrefix(name, "refs/tags/"))
+				c.NewTags = append(c.NewTags, short)
+			} else if old != obj {
+				c.MovedTags = append(c.MovedTags, short)
 			}
 		}
 	}
@@ -239,7 +271,14 @@ func (g *Git) Diff(ctx context.Context, dir string, before, after Refs) Change {
 			c.DeletedTags = append(c.DeletedTags, strings.TrimPrefix(name, "refs/tags/"))
 		}
 	}
-	for _, s := range [][]string{c.NewBranches, c.UpdatedBranches, c.DeletedBranches, c.NewTags, c.DeletedTags} {
+	for _, br := range c.UpdatedBranches {
+		// The old tip is no longer reachable from the new one: commits were dropped.
+		out, err := g.run(ctx, dir, "rev-list", "-n", "1", before["refs/heads/"+br], "^"+after["refs/heads/"+br], "--")
+		if err == nil && strings.TrimSpace(out) != "" {
+			c.RewrittenBranches = append(c.RewrittenBranches, br)
+		}
+	}
+	for _, s := range [][]string{c.NewBranches, c.UpdatedBranches, c.DeletedBranches, c.NewTags, c.DeletedTags, c.RewrittenBranches, c.MovedTags} {
 		sort.Strings(s)
 	}
 	if len(newTips) > 0 && len(before) > 0 {
@@ -254,6 +293,87 @@ func (g *Git) Diff(ctx context.Context, dir string, before, after Refs) Change {
 		}
 	}
 	return c
+}
+
+// ArchiveNamespace is where PreserveRefs keeps refs that upstream rewrote or deleted.
+const ArchiveNamespace = "refs/archive/"
+
+// PreserveRefs keeps the previous tips of rewritten/deleted branches and moved/deleted tags
+// under refs/archive/<stamp>/{heads,tags}/<name>, so no history is ever lost to a force push
+// or deletion upstream. It sets c.Snapshot and returns the number of refs preserved.
+func (g *Git) PreserveRefs(ctx context.Context, dir string, before Refs, c *Change, stamp string) (int, error) {
+	var lines []string
+	add := func(kind string, names []string) {
+		for _, n := range names {
+			if obj := before["refs/"+kind+"/"+n]; obj != "" {
+				lines = append(lines, fmt.Sprintf("create %s%s/%s/%s %s", ArchiveNamespace, stamp, kind, n, obj))
+			}
+		}
+	}
+	add("heads", c.RewrittenBranches)
+	add("heads", c.DeletedBranches)
+	add("tags", c.MovedTags)
+	add("tags", c.DeletedTags)
+	if len(lines) == 0 {
+		return 0, nil
+	}
+	if _, err := g.runInput(ctx, dir, strings.Join(lines, "\n")+"\n", "update-ref", "--stdin"); err != nil {
+		return 0, err
+	}
+	c.Snapshot = ArchiveNamespace + stamp
+	return len(lines), nil
+}
+
+// Snapshots lists the refs/archive/<stamp> namespaces (oldest first) with their ref counts.
+func (g *Git) Snapshots(ctx context.Context, dir string) ([]Snapshot, error) {
+	out, err := g.run(ctx, dir, "for-each-ref", "--format=%(refname)", ArchiveNamespace)
+	if err != nil {
+		return nil, err
+	}
+	counts := map[string]int{}
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		rest, ok := strings.CutPrefix(line, ArchiveNamespace)
+		if !ok {
+			continue
+		}
+		stamp, _, _ := strings.Cut(rest, "/")
+		counts[stamp]++
+	}
+	snaps := make([]Snapshot, 0, len(counts))
+	for s, n := range counts {
+		snaps = append(snaps, Snapshot{Stamp: s, Refs: n})
+	}
+	sort.Slice(snaps, func(i, j int) bool { return snaps[i].Stamp < snaps[j].Stamp })
+	return snaps, nil
+}
+
+type Snapshot struct {
+	Stamp string // e.g. 20261114T093000Z
+	Refs  int
+}
+
+// Commit is a one-line commit description.
+type Commit struct {
+	Hash, Subject, Author string
+	Time                  time.Time
+}
+
+// RecentCommits returns the latest n commits on the default branch (HEAD) of dir.
+func (g *Git) RecentCommits(ctx context.Context, dir string, n int) ([]Commit, error) {
+	out, err := g.run(ctx, dir, "log", "-n", strconv.Itoa(n), "--format=%h%x00%an%x00%ct%x00%s", "HEAD", "--")
+	if err != nil {
+		return nil, err
+	}
+	var commits []Commit
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		f := strings.SplitN(line, "\x00", 4)
+		if len(f) != 4 {
+			continue
+		}
+		ts, _ := strconv.ParseInt(f[2], 10, 64)
+		commits = append(commits, Commit{Hash: f[0], Author: f[1], Time: time.Unix(ts, 0), Subject: f[3]})
+	}
+	return commits, nil
 }
 
 // DefaultBranch returns the branch HEAD points to in dir (short name), or "" if unknown.

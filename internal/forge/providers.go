@@ -20,6 +20,10 @@ type GitHub struct {
 
 func (g *GitHub) Type() string { return "github" }
 
+func (g *GitHub) repoURL(owner, repo string) string {
+	return fmt.Sprintf("%s/repos/%s/%s", g.base, url.PathEscape(owner), url.PathEscape(repo))
+}
+
 type ghRelease struct {
 	TagName     string `json:"tag_name"`
 	Name        string `json:"name"`
@@ -97,6 +101,10 @@ type Gitea struct {
 
 func (g *Gitea) Type() string { return "gitea" }
 
+func (g *Gitea) repoURL(owner, repo string) string {
+	return fmt.Sprintf("%s/repos/%s/%s", g.base, url.PathEscape(owner), url.PathEscape(repo))
+}
+
 type giteaRelease struct {
 	TagName     string `json:"tag_name"`
 	Name        string `json:"name"`
@@ -163,6 +171,10 @@ type GitLab struct {
 }
 
 func (g *GitLab) Type() string { return "gitlab" }
+
+func (g *GitLab) repoURL(owner, repo string) string {
+	return fmt.Sprintf("%s/projects/%s", g.base, url.PathEscape(owner+"/"+repo))
+}
 
 type glRelease struct {
 	TagName         string `json:"tag_name"`

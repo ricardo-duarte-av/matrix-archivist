@@ -77,6 +77,7 @@ func main() {
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to create HTTP server")
 		}
+		srv.Metrics = arch.WriteMetrics
 		go func() {
 			if err := srv.Run(ctx); err != nil {
 				log.Error().Err(err).Msg("HTTP server stopped")

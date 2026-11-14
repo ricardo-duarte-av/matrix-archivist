@@ -122,7 +122,7 @@ func (a *Archiver) BuildSummary(ctx context.Context, since time.Time) (text stri
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 
-	var updated, failing []string
+	var updated, failing, gone []string
 	for _, id := range ids {
 		ra := act[id]
 		r := byID[id]
@@ -145,6 +145,11 @@ func (a *Archiver) BuildSummary(ctx context.Context, since time.Time) (text stri
 	}
 	// Every repository that is failing right now, whether or not it had events in the window.
 	for _, r := range repos {
+		if r.Upstream != "" {
+			gone = append(gone, fmt.Sprintf("- **#%d** %s — since %s: %s", r.ID, r.URL,
+				r.UpstreamSince.In(loc).Format("2006-01-02"), oneLine(r.UpstreamDetail)))
+			continue
+		}
 		if r.FailCount > 0 {
 			failing = append(failing, fmt.Sprintf("- **#%d** %s — %d failures in a row, last: `%s`", r.ID, r.URL, r.FailCount, oneLine(r.LastError)))
 		}
@@ -157,6 +162,9 @@ func (a *Archiver) BuildSummary(ctx context.Context, since time.Time) (text stri
 	}
 	if len(failing) > 0 {
 		fmt.Fprintf(&b, "\n**Failing (%d):**\n\n%s\n", len(failing), strings.Join(failing, "\n"))
+	}
+	if len(gone) > 0 {
+		fmt.Fprintf(&b, "\n**Gone upstream, preserved here (%d):**\n\n%s\n", len(gone), strings.Join(gone, "\n"))
 	}
 	fmt.Fprintf(&b, "\n_%d repositories tracked._", len(repos))
 	return b.String(), len(updated) == 0 && len(failing) == 0, nil
@@ -184,6 +192,11 @@ func MergeChanges(changes []gitops.Change) gitops.Change {
 		union(&m.DeletedBranches, c.DeletedBranches)
 		union(&m.NewTags, c.NewTags)
 		union(&m.DeletedTags, c.DeletedTags)
+		union(&m.RewrittenBranches, c.RewrittenBranches)
+		union(&m.MovedTags, c.MovedTags)
+		if c.Snapshot != "" {
+			m.Snapshot = c.Snapshot
+		}
 	}
 	return m
 }

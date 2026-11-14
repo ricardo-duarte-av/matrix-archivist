@@ -4,6 +4,7 @@ package web
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"embed"
@@ -39,6 +40,9 @@ type Server struct {
 	log  zerolog.Logger
 	tmpl *template.Template
 	zips chan struct{} // semaphore for concurrent zip generation
+
+	// Metrics writes Prometheus metrics; served at /metrics when set and http.metrics is on.
+	Metrics func(ctx context.Context, w io.Writer) error
 }
 
 func New(cfg config.HTTP, storageDir string, log zerolog.Logger) (*Server, error) {
@@ -69,6 +73,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /browse/{path...}", s.handleBrowse)
 	mux.HandleFunc("GET /download/{path...}", s.handleDownload)
 	mux.HandleFunc("GET /zip/{path...}", s.handleZip)
+	if s.cfg.Metrics && s.Metrics != nil {
+		mux.HandleFunc("GET /metrics", s.handleMetrics)
+	}
 
 	var h http.Handler = mux
 	if s.cfg.Username != "" {
@@ -397,6 +404,17 @@ func (s *Server) fail(w http.ResponseWriter, err error) {
 		s.log.Warn().Err(err).Msg("HTTP error")
 		http.Error(w, fmt.Sprintf("error: %v", err), http.StatusInternalServerError)
 	}
+}
+
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	var buf bytes.Buffer
+	if err := s.Metrics(r.Context(), &buf); err != nil {
+		s.fail(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = buf.WriteTo(w)
 }
 
 func (s *Server) basicAuth(next http.Handler) http.Handler {

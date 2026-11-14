@@ -3,11 +3,13 @@ package bot
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"math"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"go.mau.fi/util/dbutil"
 	"maunium.net/go/mautrix/crypto"
@@ -155,5 +157,82 @@ func TestAlertContent(t *testing.T) {
 	raw, _ := json.Marshal(c)
 	if !strings.Contains(string(raw), `"m.mentions":{"room":true}`) {
 		t.Errorf("json %s", raw)
+	}
+}
+
+func TestReplyRelation(t *testing.T) {
+	plain := &event.Event{ID: "$cmd", Content: event.Content{Parsed: &event.MessageEventContent{MsgType: event.MsgText, Body: "!a list"}}}
+	if rel := ReplyRelation(plain, false); rel.GetReplyTo() != "$cmd" || rel.Type != "" {
+		t.Errorf("short reply: %+v", rel)
+	}
+	if rel := ReplyRelation(plain, true); rel.GetThreadParent() != "$cmd" || !rel.IsFallingBack {
+		t.Errorf("long reply should start a thread: %+v", rel)
+	}
+	inThread := &event.Event{ID: "$cmd2", Content: event.Content{Parsed: &event.MessageEventContent{
+		MsgType: event.MsgText, Body: "!a list",
+		RelatesTo: (&event.RelatesTo{}).SetThread("$root", "$x"),
+	}}}
+	for _, long := range []bool{false, true} {
+		rel := ReplyRelation(inThread, long)
+		if rel.GetThreadParent() != "$root" || rel.GetReplyTo() != "$cmd2" || rel.IsFallingBack {
+			t.Errorf("in-thread reply (long=%v): %+v", long, rel)
+		}
+	}
+	if IsLong("a\nb") || !IsLong(strings.Repeat("line\n", 20)) {
+		t.Error("IsLong")
+	}
+}
+
+func TestFilterRepos(t *testing.T) {
+	repos := []*store.Repo{
+		{ID: 1, URL: "https://github.com/a/ytdl", Tags: []string{"video"}, Notes: "Took down in 2020"},
+		{ID: 2, URL: "https://codeberg.org/b/tool", Tags: []string{"cli", "video"}},
+		{ID: 3, URL: "https://gitlab.com/c/other"},
+	}
+	ids := func(rs []*store.Repo) (out []int64) {
+		for _, r := range rs {
+			out = append(out, r.ID)
+		}
+		return
+	}
+	for _, tc := range []struct {
+		terms []string
+		want  string
+	}{
+		{[]string{"#video"}, "[1 2]"},
+		{[]string{"#VIDEO", "codeberg"}, "[2]"},
+		{[]string{"took"}, "[1]"},
+		{[]string{"#vid"}, "[]"},
+		{[]string{"gitlab"}, "[3]"},
+	} {
+		if got := fmt.Sprint(ids(FilterRepos(repos, tc.terms))); got != tc.want && !(tc.want == "[]" && got == "[]") {
+			t.Errorf("%v: got %s want %s", tc.terms, got, tc.want)
+		}
+	}
+}
+
+func TestExportImport(t *testing.T) {
+	now := time.Date(2026, 11, 14, 10, 0, 0, 0, time.UTC)
+	data := Export([]*store.Repo{{URL: "https://github.com/a/b", Notes: "why", Tags: []string{"x"}, AddedBy: "@u:s", AddedAt: now}}, now)
+	entries, err := ParseImport(data)
+	if err != nil || len(entries) != 1 || entries[0].URL != "https://github.com/a/b" || entries[0].Notes != "why" || entries[0].Tags[0] != "x" {
+		t.Fatalf("roundtrip: %+v %v\n%s", entries, err, data)
+	}
+	entries, err = ParseImport([]byte("# my list\nhttps://github.com/a/b\n\n  git@codeberg.org:c/d.git  trailing comment\n"))
+	if err != nil || len(entries) != 2 || entries[1].URL != "git@codeberg.org:c/d.git" {
+		t.Fatalf("text import: %+v %v", entries, err)
+	}
+	if _, err := ParseImport([]byte(`{"format":"something-else"}`)); err == nil {
+		t.Error("unknown format accepted")
+	}
+	if _, err := ParseImport([]byte("# nothing\n")); err == nil {
+		t.Error("empty import accepted")
+	}
+}
+
+func TestWidgetContent(t *testing.T) {
+	c := WidgetContent("https://archive.example.org", "Archive", "@archivist:example.org")
+	if c["url"] != "https://archive.example.org/browse/" || c["type"] != "m.custom" || c["id"] != widgetID {
+		t.Errorf("widget: %v", c)
 	}
 }

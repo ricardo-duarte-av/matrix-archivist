@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -134,6 +135,73 @@ func TestMirrorLifecycle(t *testing.T) {
 	after, _ = g.SnapshotRefs(ctx, mirror)
 	if _, ok := after["refs/heads/feature"]; ok {
 		t.Fatal("branch should be pruned")
+	}
+}
+
+func TestPreserveRewrittenHistory(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	upstream := filepath.Join(tmp, "upstream")
+	os.MkdirAll(upstream, 0o755)
+	run(t, upstream, "init", "-q", "-b", "main")
+	commit(t, upstream, "a")
+	commit(t, upstream, "b")
+	commit(t, upstream, "c")
+	run(t, upstream, "tag", "v1")
+
+	g := New()
+	g.AllowLocalRemotes = true
+	mirror := filepath.Join(tmp, "mirror.git")
+	if err := g.CloneMirror(ctx, upstream, mirror); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := g.SnapshotRefs(ctx, mirror)
+	oldMain := before["refs/heads/main"]
+
+	// Upstream rewrites history: drops b and c, adds d, and moves tag v1.
+	run(t, upstream, "reset", "-q", "--hard", "HEAD~2")
+	commit(t, upstream, "d")
+	run(t, upstream, "tag", "-f", "v1")
+	// Aggressive gc upstream so the dropped commits are really gone there.
+	run(t, upstream, "reflog", "expire", "--expire=now", "--all")
+	run(t, upstream, "gc", "-q", "--prune=now")
+
+	if err := g.FetchMirror(ctx, mirror, true); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := g.SnapshotRefs(ctx, mirror)
+	ch := g.Diff(ctx, mirror, before, after)
+	if len(ch.RewrittenBranches) != 1 || ch.RewrittenBranches[0] != "main" || len(ch.MovedTags) != 1 || !ch.Destructive() {
+		t.Fatalf("unexpected change: %+v", ch)
+	}
+	n, err := g.PreserveRefs(ctx, mirror, before, &ch, "20261114T000000Z")
+	if err != nil || n != 2 || ch.Snapshot != "refs/archive/20261114T000000Z" {
+		t.Fatalf("preserve: n=%d err=%v snap=%q", n, err, ch.Snapshot)
+	}
+	got, err := g.run(ctx, mirror, "rev-parse", "refs/archive/20261114T000000Z/heads/main")
+	if err != nil || strings.TrimSpace(got) != oldMain {
+		t.Fatalf("archived ref = %q (%v), want %s", got, err, oldMain)
+	}
+	// Archived refs survive a further pruning fetch and an aggressive gc.
+	_ = g.FetchMirror(ctx, mirror, true)
+	run(t, mirror, "gc", "-q", "--prune=now")
+	if _, err := g.run(ctx, mirror, "cat-file", "-e", oldMain+"^{commit}"); err != nil {
+		t.Fatal("old commit lost after gc")
+	}
+	snaps, _ := g.Snapshots(ctx, mirror)
+	if len(snaps) != 1 || snaps[0].Refs != 2 {
+		t.Fatalf("snapshots: %+v", snaps)
+	}
+	// Archive refs are not reported as branches/tags.
+	if refs, _ := g.SnapshotRefs(ctx, mirror); len(refs) != 2 {
+		t.Fatalf("refs: %v", refs)
+	}
+	commits, err := g.RecentCommits(ctx, mirror, 5)
+	if err != nil || len(commits) != 2 || commits[0].Subject != "d" {
+		t.Fatalf("recent commits: %+v %v", commits, err)
+	}
+	if ch.Summary() == "" || !strings.Contains(ch.Summary(), "history rewritten on main") {
+		t.Errorf("summary: %s", ch.Summary())
 	}
 }
 

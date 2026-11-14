@@ -39,6 +39,11 @@ type Archiver struct {
 	locks   map[int64]*sync.Mutex
 
 	cycleRunning atomic.Bool
+
+	// Counters exposed as metrics.
+	checksOK, checksFailed atomic.Int64
+	lastCycleEnd           atomic.Int64 // unix seconds
+	lastCycleDur           atomic.Int64 // milliseconds
 }
 
 func New(cfg *config.Config, st *store.Store, log zerolog.Logger) *Archiver {
@@ -81,6 +86,11 @@ type Result struct {
 	NewReleases []string
 	Err         error // git error (fatal for this check)
 	Warnings    []string
+	Preserved   int // refs saved under refs/archive because upstream rewrote/deleted them
+
+	url    gitops.RepoURL
+	urlOK  bool
+	branch string // default branch after the check
 }
 
 func (r Result) Changed() bool { return r.Cloned || !r.Change.Empty() || len(r.NewReleases) > 0 }
@@ -146,6 +156,7 @@ func (a *Archiver) Check(ctx context.Context, id int64) Result {
 		res.Err = err
 		return a.finish(ctx, res, log)
 	}
+	res.url, res.urlOK = u, true
 
 	gctx, cancel := context.WithTimeout(ctx, a.cfg.GitTimeout)
 	defer cancel()
@@ -174,7 +185,19 @@ func (a *Archiver) Check(ctx context.Context, id int64) Result {
 			return a.finish(ctx, res, log)
 		}
 		res.Change = a.git.Diff(gctx, mirror, before, after)
+		if res.Change.Destructive() {
+			stamp := time.Now().UTC().Format("20060102T150405Z")
+			n, err := a.git.PreserveRefs(gctx, mirror, before, &res.Change, stamp)
+			if err != nil {
+				log.Err(err).Msg("Failed to preserve rewritten refs")
+				res.Warnings = append(res.Warnings, "preserving old refs: "+oneLine(err.Error()))
+			} else {
+				res.Preserved = n
+				log.Warn().Str("snapshot", res.Change.Snapshot).Int("refs", n).Msg("Upstream rewrote or deleted refs; old tips preserved")
+			}
+		}
 	}
+	res.branch = a.git.DefaultBranch(gctx, mirror)
 
 	if res.Cloned || !res.Change.Empty() || !dirExists(a.checkoutDir(repo)) {
 		if err := a.git.SyncCheckout(gctx, mirror, a.checkoutDir(repo)); err != nil {
@@ -198,18 +221,39 @@ func (a *Archiver) finish(ctx context.Context, res Result, log zerolog.Logger) R
 	}
 	switch {
 	case res.Err != nil:
+		a.checksFailed.Add(1)
 		log.Warn().Err(res.Err).Msg("Check failed")
 		_ = a.store.AddEvent(ctx, repo.ID, store.EventError, oneLine(res.Err.Error()))
-		if n := repo.FailCount + 1; a.cfg.FailureAlert > 0 && n == a.cfg.FailureAlert {
+		alerted := repo.Upstream != ""
+		// Only archived repos can "disappear"; a never-cloned one is just a bad URL.
+		if st := a.probeUpstream(ctx, res); repo.Cloned && st.State == forge.Gone || st.State == forge.Legal || st.State == forge.Blocked {
+			_ = a.store.SetUpstream(ctx, repo.ID, st.State, st.Detail)
+			if repo.Upstream != st.State {
+				log.Warn().Str("state", st.State).Str("detail", st.Detail).Msg("Repository disappeared upstream")
+				_ = a.store.AddEvent(ctx, repo.ID, store.EventGone, st.State+": "+st.Detail)
+				nrel, _ := a.store.ReleaseCount(ctx, repo.ID)
+				a.Alert(ctx, a.GoneAlertText(repo, st, nrel))
+			}
+			alerted = true
+		}
+		if n := repo.FailCount + 1; !alerted && a.cfg.FailureAlert > 0 && n == a.cfg.FailureAlert {
 			a.Alert(ctx, FailureAlertText(repo, n, res.Err))
 		}
 	default:
-		if wasFailing {
+		a.checksOK.Add(1)
+		if repo.Upstream != "" {
+			_ = a.store.SetUpstream(ctx, repo.ID, "", "")
+			_ = a.store.AddEvent(ctx, repo.ID, store.EventRecovered, "back upstream")
+			a.Notify(ctx, fmt.Sprintf("♻️ **#%d** %s is reachable upstream again.", repo.ID, repo.URL))
+		} else if wasFailing {
 			_ = a.store.AddEvent(ctx, repo.ID, store.EventRecovered, "recovered")
 			// Only announce recovery if the room was alerted about the failure.
 			if a.cfg.FailureAlert > 0 && repo.FailCount >= a.cfg.FailureAlert {
 				a.Notify(ctx, fmt.Sprintf("✅ **#%d** %s is working again after %d failed checks.", repo.ID, repo.URL, repo.FailCount))
 			}
+		}
+		if res.Changed() || repo.SizeBytes == 0 {
+			_ = a.store.SetSize(ctx, repo.ID, gitops.DirSize(a.RepoDir(repo)))
 		}
 		if res.Cloned {
 			detail := "initial clone"
@@ -226,12 +270,81 @@ func (a *Archiver) finish(ctx context.Context, res Result, log zerolog.Logger) R
 				_ = a.store.AddEvent(ctx, repo.ID, store.EventRelease, t)
 			}
 		}
+		if text := RewriteNoticeText(repo, res.Change, res.branch); text != "" {
+			a.Notify(ctx, text)
+		}
 		log.Debug().Str("result", res.Text()).Msg("Checked repository")
 	}
 	if r, err := a.store.Repo(ctx, repo.ID); err == nil {
 		res.Repo = r
 	}
 	return res
+}
+
+// probeUpstream asks the forge (or the repository's web page) whether a failing repository
+// still exists, and falls back to recognising takedown messages in git's error.
+func (a *Archiver) probeUpstream(ctx context.Context, res Result) forge.RepoStatus {
+	if !res.urlOK || !res.Repo.Cloned || ctx.Err() != nil {
+		return forge.RepoStatus{State: forge.Unknown}
+	}
+	u := res.url
+	pctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	st := a.forge.Probe(pctx, a.provider(pctx, u.Host), u.Owner, u.Name, "https://"+u.Host+"/"+u.Path)
+	if st.State == forge.Unknown {
+		if g := forge.ClassifyGitError(res.Err.Error()); g.State != forge.Unknown {
+			return g
+		}
+	}
+	return st
+}
+
+// GoneAlertText is the @room alert sent when a repository disappears upstream.
+func (a *Archiver) GoneAlertText(repo *store.Repo, st forge.RepoStatus, releases int) string {
+	icon, what := "🪦", "has disappeared upstream"
+	switch st.State {
+	case forge.Legal:
+		icon, what = "⚖️", "has been taken down upstream"
+	case forge.Blocked:
+		icon, what = "🚫", "has been blocked upstream"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s **#%d** %s %s: %s\n\n", icon, repo.ID, repo.URL, what, st.Detail)
+	last := "never"
+	if !repo.LastChanged.IsZero() {
+		last = repo.LastChanged.In(a.cfg.Summary.Location).Format("2006-01-02 15:04 MST")
+	}
+	fmt.Fprintf(&b, "The archive is safe: %s, %d releases, last change synced %s.", gitops.HumanSize(repo.SizeBytes), releases, last)
+	if u := a.cfg.HTTP.BrowseURL(repo.RelDir); u != "" {
+		fmt.Fprintf(&b, " Browse: %s", u)
+	}
+	return b.String()
+}
+
+// RewriteNoticeText describes destructive upstream changes worth telling the room about right
+// away: history rewritten on the default branch, or tags moved/deleted. Rewrites of other
+// branches only appear in the summary. Returns "" if there is nothing to announce.
+func RewriteNoticeText(repo *store.Repo, c gitops.Change, defaultBranch string) string {
+	var what []string
+	for _, br := range c.RewrittenBranches {
+		if br == defaultBranch {
+			what = append(what, fmt.Sprintf("history of `%s` was rewritten (force push)", br))
+		}
+	}
+	if len(c.MovedTags) > 0 {
+		what = append(what, fmt.Sprintf("tags were moved: %s", strings.Join(c.MovedTags, ", ")))
+	}
+	if len(c.DeletedTags) > 0 {
+		what = append(what, fmt.Sprintf("tags were deleted: %s", strings.Join(c.DeletedTags, ", ")))
+	}
+	if len(what) == 0 {
+		return ""
+	}
+	text := fmt.Sprintf("⚠️ **#%d** %s: upstream %s.", repo.ID, repo.URL, strings.Join(what, "; "))
+	if c.Snapshot != "" {
+		text += fmt.Sprintf(" The previous state is preserved in `mirror.git` under `%s/`.", c.Snapshot)
+	}
+	return text
 }
 
 // FailureAlertText is the body of the @room alert sent when a repo hits the failure threshold.
@@ -374,7 +487,21 @@ func (a *Archiver) RunCycle(ctx context.Context) (results []Result, ran bool) {
 	}
 	start := time.Now()
 	a.log.Info().Int("repos", len(repos)).Msg("Starting check cycle")
+	ids := make([]int64, len(repos))
+	for i, r := range repos {
+		ids[i] = r.ID
+	}
+	results = a.CheckMany(ctx, ids)
+	took := time.Since(start)
+	a.lastCycleEnd.Store(time.Now().Unix())
+	a.lastCycleDur.Store(took.Milliseconds())
+	a.log.Info().Int("repos", len(results)).Dur("took", took).Msg("Check cycle finished")
+	a.CheckDisk(ctx)
+	return results, true
+}
 
+// CheckMany checks the given repositories with bounded concurrency.
+func (a *Archiver) CheckMany(ctx context.Context, ids []int64) (results []Result) {
 	jobs := make(chan int64)
 	out := make(chan Result)
 	var wg sync.WaitGroup
@@ -389,9 +516,9 @@ func (a *Archiver) RunCycle(ctx context.Context) (results []Result, ran bool) {
 	}
 	go func() {
 		defer close(jobs)
-		for _, r := range repos {
+		for _, id := range ids {
 			select {
-			case jobs <- r.ID:
+			case jobs <- id:
 			case <-ctx.Done():
 				return
 			}
@@ -401,8 +528,7 @@ func (a *Archiver) RunCycle(ctx context.Context) (results []Result, ran bool) {
 	for r := range out {
 		results = append(results, r)
 	}
-	a.log.Info().Int("repos", len(results)).Dur("took", time.Since(start)).Msg("Check cycle finished")
-	return results, true
+	return results
 }
 
 // Run executes the periodic check loop and summary scheduler until ctx is cancelled.

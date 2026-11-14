@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -28,7 +30,23 @@ type Repo struct {
 	LastError   string
 	FailCount   int
 	Cloned      bool
+
+	// Upstream is "" while the upstream repo is believed to exist, or one of UpstreamGone,
+	// UpstreamLegal, UpstreamBlocked once a failing check found it missing.
+	Upstream       string
+	UpstreamDetail string
+	UpstreamSince  time.Time
+
+	Notes     string
+	Tags      []string
+	SizeBytes int64
 }
+
+const (
+	UpstreamGone    = "gone"    // 404/410: deleted, renamed away or made private
+	UpstreamLegal   = "legal"   // 451: unavailable for legal reasons (DMCA etc.)
+	UpstreamBlocked = "blocked" // forge blocked access (ToS, etc.)
+)
 
 type Event struct {
 	ID     int64
@@ -44,6 +62,7 @@ const (
 	EventError     = "error"
 	EventAdded     = "added"
 	EventRecovered = "recovered"
+	EventGone      = "gone"
 )
 
 type Store struct {
@@ -113,6 +132,12 @@ var migrations = []string{
 		key   TEXT PRIMARY KEY,
 		value TEXT NOT NULL
 	);`,
+	`ALTER TABLE repos ADD COLUMN upstream TEXT NOT NULL DEFAULT '';
+	ALTER TABLE repos ADD COLUMN upstream_detail TEXT NOT NULL DEFAULT '';
+	ALTER TABLE repos ADD COLUMN upstream_since INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE repos ADD COLUMN notes TEXT NOT NULL DEFAULT '';
+	ALTER TABLE repos ADD COLUMN tags TEXT NOT NULL DEFAULT '';
+	ALTER TABLE repos ADD COLUMN size_bytes INTEGER NOT NULL DEFAULT 0;`,
 }
 
 func (s *Store) migrate(ctx context.Context) error {
@@ -162,19 +187,84 @@ func fromUnix(v int64) time.Time {
 	return time.Unix(v, 0)
 }
 
-const repoCols = `id, url, key, rel_dir, added_by, added_at, last_checked, last_changed, last_error, fail_count, cloned`
+const repoCols = `id, url, key, rel_dir, added_by, added_at, last_checked, last_changed, last_error, fail_count, cloned,
+	upstream, upstream_detail, upstream_since, notes, tags, size_bytes`
 
 func scanRepo(row interface{ Scan(...any) error }) (*Repo, error) {
 	var r Repo
-	var added, checked, changed int64
-	if err := row.Scan(&r.ID, &r.URL, &r.Key, &r.RelDir, &r.AddedBy, &added, &checked, &changed, &r.LastError, &r.FailCount, &r.Cloned); err != nil {
+	var added, checked, changed, upSince int64
+	var tags string
+	if err := row.Scan(&r.ID, &r.URL, &r.Key, &r.RelDir, &r.AddedBy, &added, &checked, &changed, &r.LastError, &r.FailCount, &r.Cloned,
+		&r.Upstream, &r.UpstreamDetail, &upSince, &r.Notes, &tags, &r.SizeBytes); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
 		return nil, err
 	}
 	r.AddedAt, r.LastChecked, r.LastChanged = fromUnix(added), fromUnix(checked), fromUnix(changed)
+	r.UpstreamSince = fromUnix(upSince)
+	r.Tags = SplitTags(tags)
 	return &r, nil
+}
+
+// SplitTags parses the stored comma-separated tag list.
+func SplitTags(s string) []string {
+	var out []string
+	for _, t := range strings.Split(s, ",") {
+		if t = strings.TrimSpace(t); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// NormalizeTag lowercases a tag and strips characters that would break storage or display.
+func NormalizeTag(t string) string {
+	t = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(t, "#")))
+	return strings.Map(func(r rune) rune {
+		if r == ',' || r == '`' || r == '*' || r == '_' || r < 0x20 {
+			return -1
+		}
+		if r == ' ' {
+			return '-'
+		}
+		return r
+	}, t)
+}
+
+// SetUpstream records the upstream status ("" = available). The since time is kept while
+// the status doesn't change.
+func (s *Store) SetUpstream(ctx context.Context, id int64, status, detail string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE repos SET
+		upstream_since = CASE WHEN ? = '' THEN 0 WHEN upstream = ? THEN upstream_since ELSE ? END,
+		upstream = ?, upstream_detail = ? WHERE id = ?`,
+		status, status, time.Now().Unix(), status, detail, id)
+	return err
+}
+
+func (s *Store) SetNotes(ctx context.Context, id int64, notes string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE repos SET notes = ? WHERE id = ?`, notes, id)
+	return err
+}
+
+// SetTags replaces a repo's tags (normalized, de-duplicated, sorted).
+func (s *Store) SetTags(ctx context.Context, id int64, tags []string) error {
+	seen := map[string]bool{}
+	var clean []string
+	for _, t := range tags {
+		if t = NormalizeTag(t); t != "" && !seen[t] {
+			seen[t] = true
+			clean = append(clean, t)
+		}
+	}
+	sort.Strings(clean)
+	_, err := s.db.ExecContext(ctx, `UPDATE repos SET tags = ? WHERE id = ?`, strings.Join(clean, ","), id)
+	return err
+}
+
+func (s *Store) SetSize(ctx context.Context, id int64, size int64) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE repos SET size_bytes = ? WHERE id = ?`, size, id)
+	return err
 }
 
 func (s *Store) AddRepo(ctx context.Context, url, key, relDir, addedBy string) (*Repo, error) {
@@ -297,6 +387,36 @@ func (s *Store) AddRelease(ctx context.Context, repoID int64, tag, name string, 
 		`INSERT OR REPLACE INTO releases (repo_id, tag, name, published_at, archived_at) VALUES (?, ?, ?, ?, ?)`,
 		repoID, tag, name, unix(published), time.Now().Unix())
 	return err
+}
+
+// ReleaseCounts returns the number of archived releases per repo.
+func (s *Store) ReleaseCounts(ctx context.Context) (map[int64]int, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT repo_id, COUNT(*) FROM releases GROUP BY repo_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int64]int{}
+	for rows.Next() {
+		var id int64
+		var n int
+		if err := rows.Scan(&id, &n); err != nil {
+			return nil, err
+		}
+		out[id] = n
+	}
+	return out, rows.Err()
+}
+
+// LatestRelease returns the most recently published archived release ("" tag if none).
+func (s *Store) LatestRelease(ctx context.Context, repoID int64) (tag string, published time.Time, err error) {
+	var ts int64
+	err = s.db.QueryRowContext(ctx,
+		`SELECT tag, published_at FROM releases WHERE repo_id = ? ORDER BY published_at DESC, archived_at DESC LIMIT 1`, repoID).Scan(&tag, &ts)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", time.Time{}, nil
+	}
+	return tag, fromUnix(ts), err
 }
 
 func (s *Store) ReleaseCount(ctx context.Context, repoID int64) (int, error) {

@@ -2,6 +2,7 @@ package web
 
 import (
 	"archive/zip"
+	"context"
 	"bytes"
 	"io"
 	"net/http"
@@ -169,5 +170,20 @@ func TestBasicAuth(t *testing.T) {
 	}
 	if resp, _ := get(t, srv.URL+"/static/style.css"); resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("static without auth: %d", resp.StatusCode)
+	}
+}
+
+func TestMetrics(t *testing.T) {
+	tmp := t.TempDir()
+	s, err := New(config.HTTP{Enabled: true, MaxConcurrentZips: 1, Metrics: true}, tmp, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Metrics = func(_ context.Context, w io.Writer) error { _, err := io.WriteString(w, "archivist_repos 3\n"); return err }
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+	resp, body := get(t, srv.URL+"/metrics")
+	if resp.StatusCode != 200 || body != "archivist_repos 3\n" || !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/plain") {
+		t.Fatalf("metrics: %d %q", resp.StatusCode, body)
 	}
 }

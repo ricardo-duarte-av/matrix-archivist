@@ -314,20 +314,6 @@ func AlertContent(markdown string) *event.MessageEventContent {
 	return &c
 }
 
-// reply sends a message in reply to evt.
-func (b *Bot) reply(evt *event.Event, markdown string) {
-	c := b.content(markdown)
-	c.RelatesTo = (&event.RelatesTo{}).SetReplyTo(evt.ID)
-	if _, err := b.client.SendMessageEvent(b.ctx, b.roomID, event.EventMessage, c); err != nil {
-		b.log.Err(err).Msg("Failed to send reply")
-	}
-}
-
-// react adds an emoji reaction to evt (best effort).
-func (b *Bot) react(evt *event.Event, key string) {
-	_, _ = b.client.SendReaction(b.ctx, b.roomID, evt.ID, key)
-}
-
 // refreshState fetches the full room state into the state store (encryption, power levels,
 // create event), so it is correct even if earlier syncs were missed.
 func (b *Bot) refreshState(ctx context.Context) {
@@ -347,6 +333,7 @@ func (b *Bot) refreshState(ctx context.Context) {
 				Msg("Bot's power level is too low for @room alerts to notify anyone; raise it in the room settings")
 		}
 	}
+	b.syncWidget(ctx)
 }
 
 // powerLevel returns the user's power level, fetched fresh from the server. Room creators in

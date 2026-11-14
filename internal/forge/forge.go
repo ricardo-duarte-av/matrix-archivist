@@ -39,6 +39,9 @@ type Release struct {
 type Provider interface {
 	Type() string
 	ListReleases(ctx context.Context, owner, repo string) ([]Release, error)
+	// repoURL is the API URL describing the repository itself (used by Probe).
+	repoURL(owner, repo string) string
+	header() http.Header
 }
 
 // ErrNoRepo is returned when the forge says the repository does not exist (404).

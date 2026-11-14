@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -64,6 +65,33 @@ type HTTP struct {
 	Password string `yaml:"password"`
 	// Maximum number of zip downloads generated at the same time.
 	MaxConcurrentZips int `yaml:"max_concurrent_zips"`
+	// Metrics serves Prometheus metrics at /metrics (behind basic auth when it is enabled).
+	Metrics bool `yaml:"metrics"`
+	// Widget adds the file browser to the room as a widget (needs public_url).
+	Widget Widget `yaml:"widget"`
+}
+
+type Widget struct {
+	Enabled bool   `yaml:"enabled"`
+	Name    string `yaml:"name"`
+	// Pin shows the widget at the top of the room for everyone (Element's room layout).
+	Pin bool `yaml:"pin"`
+}
+
+// BrowseURL returns the public file-browser URL for a storage-relative directory, or "" when
+// the browser is disabled or public_url isn't set.
+func (h HTTP) BrowseURL(relDir string) string {
+	if !h.Enabled || h.PublicURL == "" {
+		return ""
+	}
+	if relDir == "" {
+		return h.PublicURL + "/browse/"
+	}
+	parts := strings.Split(relDir, "/")
+	for i, p := range parts {
+		parts[i] = url.PathEscape(p)
+	}
+	return h.PublicURL + "/browse/" + strings.Join(parts, "/") + "/"
 }
 
 // Addr is the listen address, e.g. "0.0.0.0:8080".
@@ -81,6 +109,8 @@ type Config struct {
 	GitTimeoutRaw    string   `yaml:"git_timeout"`
 	FailureAlert     int      `yaml:"failure_alert_threshold"`
 	PruneDeleted     bool     `yaml:"prune_deleted"`
+	DiskWarnFreeRaw  string   `yaml:"disk_warn_free"`
+	ThreadReplies    bool     `yaml:"thread_replies"`
 	LogLevel         string   `yaml:"log_level"`
 	Summary          Summary  `yaml:"summary"`
 	Releases         Releases `yaml:"releases"`
@@ -89,6 +119,7 @@ type Config struct {
 
 	CheckInterval time.Duration `yaml:"-"`
 	GitTimeout    time.Duration `yaml:"-"`
+	DiskWarnFree  int64         `yaml:"-"`
 }
 
 func defaults() *Config {
@@ -102,6 +133,8 @@ func defaults() *Config {
 		Concurrency:      3,
 		GitTimeoutRaw:    "30m",
 		FailureAlert:     5,
+		DiskWarnFreeRaw:  "5GB",
+		ThreadReplies:    true,
 		LogLevel:         "info",
 		Summary: Summary{
 			Enabled:  true,
@@ -113,6 +146,8 @@ func defaults() *Config {
 			Bind:              "0.0.0.0",
 			Port:              8080,
 			MaxConcurrentZips: 2,
+			Metrics:           true,
+			Widget:            Widget{Enabled: true, Name: "Archive"},
 		},
 		Releases: Releases{
 			Enabled:            true,
@@ -211,6 +246,13 @@ func (c *Config) validate() error {
 	}
 	if c.Summary.Location, err = time.LoadLocation(c.Summary.Timezone); err != nil {
 		add("summary.timezone: %v", err)
+	}
+
+	if c.DiskWarnFree, err = ParseSize(c.DiskWarnFreeRaw); err != nil {
+		add("disk_warn_free: %v", err)
+	}
+	if c.HTTP.Widget.Name == "" {
+		c.HTTP.Widget.Name = "Archive"
 	}
 
 	if c.Releases.MaxAssetSize, err = ParseSize(c.Releases.MaxAssetSizeRaw); err != nil {
