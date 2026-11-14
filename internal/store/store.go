@@ -40,6 +40,18 @@ type Repo struct {
 	Notes     string
 	Tags      []string
 	SizeBytes int64
+
+	// Metadata from the forge API (description, homepage, topics) and from the README
+	// (title, first paragraph, community links). The full README text is stored for search
+	// but not loaded into Repo.
+	Description   string
+	Homepage      string
+	Topics        []string
+	ReadmeTitle   string
+	ReadmeSummary string
+	Links         []string
+	ReadmeAt      time.Time
+	ForgeInfoAt   time.Time
 }
 
 const (
@@ -138,6 +150,15 @@ var migrations = []string{
 	ALTER TABLE repos ADD COLUMN notes TEXT NOT NULL DEFAULT '';
 	ALTER TABLE repos ADD COLUMN tags TEXT NOT NULL DEFAULT '';
 	ALTER TABLE repos ADD COLUMN size_bytes INTEGER NOT NULL DEFAULT 0;`,
+	`ALTER TABLE repos ADD COLUMN description TEXT NOT NULL DEFAULT '';
+	ALTER TABLE repos ADD COLUMN homepage TEXT NOT NULL DEFAULT '';
+	ALTER TABLE repos ADD COLUMN topics TEXT NOT NULL DEFAULT '';
+	ALTER TABLE repos ADD COLUMN readme_title TEXT NOT NULL DEFAULT '';
+	ALTER TABLE repos ADD COLUMN readme_summary TEXT NOT NULL DEFAULT '';
+	ALTER TABLE repos ADD COLUMN links TEXT NOT NULL DEFAULT '';
+	ALTER TABLE repos ADD COLUMN readme_text TEXT NOT NULL DEFAULT '';
+	ALTER TABLE repos ADD COLUMN readme_at INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE repos ADD COLUMN forge_info_at INTEGER NOT NULL DEFAULT 0;`,
 }
 
 func (s *Store) migrate(ctx context.Context) error {
@@ -188,14 +209,16 @@ func fromUnix(v int64) time.Time {
 }
 
 const repoCols = `id, url, key, rel_dir, added_by, added_at, last_checked, last_changed, last_error, fail_count, cloned,
-	upstream, upstream_detail, upstream_since, notes, tags, size_bytes`
+	upstream, upstream_detail, upstream_since, notes, tags, size_bytes,
+	description, homepage, topics, readme_title, readme_summary, links, readme_at, forge_info_at`
 
 func scanRepo(row interface{ Scan(...any) error }) (*Repo, error) {
 	var r Repo
-	var added, checked, changed, upSince int64
-	var tags string
+	var added, checked, changed, upSince, readmeAt, forgeAt int64
+	var tags, topics, links string
 	if err := row.Scan(&r.ID, &r.URL, &r.Key, &r.RelDir, &r.AddedBy, &added, &checked, &changed, &r.LastError, &r.FailCount, &r.Cloned,
-		&r.Upstream, &r.UpstreamDetail, &upSince, &r.Notes, &tags, &r.SizeBytes); err != nil {
+		&r.Upstream, &r.UpstreamDetail, &upSince, &r.Notes, &tags, &r.SizeBytes,
+		&r.Description, &r.Homepage, &topics, &r.ReadmeTitle, &r.ReadmeSummary, &links, &readmeAt, &forgeAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -204,6 +227,9 @@ func scanRepo(row interface{ Scan(...any) error }) (*Repo, error) {
 	r.AddedAt, r.LastChecked, r.LastChanged = fromUnix(added), fromUnix(checked), fromUnix(changed)
 	r.UpstreamSince = fromUnix(upSince)
 	r.Tags = SplitTags(tags)
+	r.Topics = SplitTags(topics)
+	r.Links = splitLines(links)
+	r.ReadmeAt, r.ForgeInfoAt = fromUnix(readmeAt), fromUnix(forgeAt)
 	return &r, nil
 }
 
@@ -457,4 +483,91 @@ func (s *Store) Set(ctx context.Context, key, value string) error {
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, value)
 	return err
+}
+
+func splitLines(s string) []string {
+	var out []string
+	for _, l := range strings.Split(s, "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// Readme is what the archiver extracted from a repository's README.
+type Readme struct {
+	Title   string
+	Summary string
+	Links   []string
+	Text    string // full text, used for search only
+}
+
+// SetReadme stores README-derived metadata.
+func (s *Store) SetReadme(ctx context.Context, id int64, r Readme) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE repos SET readme_title = ?, readme_summary = ?, links = ?, readme_text = ?, readme_at = ? WHERE id = ?`,
+		r.Title, r.Summary, strings.Join(r.Links, "\n"), r.Text, time.Now().Unix(), id)
+	return err
+}
+
+// SetForgeInfo stores the forge's description, homepage and topics. A nil info only records the
+// attempt time (so unreachable forges are not asked again on every check).
+func (s *Store) SetForgeInfo(ctx context.Context, id int64, description, homepage string, topics []string, ok bool) error {
+	if !ok {
+		_, err := s.db.ExecContext(ctx, `UPDATE repos SET forge_info_at = ? WHERE id = ?`, time.Now().Unix(), id)
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE repos SET description = ?, homepage = ?, topics = ?, forge_info_at = ? WHERE id = ?`,
+		description, homepage, strings.Join(topics, ","), time.Now().Unix(), id)
+	return err
+}
+
+// SearchRepos returns the repositories matching every term, in id order. A "#tag" term (not
+// all digits) matches a tag exactly; any other term is a case-insensitive substring of the
+// URL, notes, tags, forge description/homepage/topics or README. Ranking is up to the caller.
+func (s *Store) SearchRepos(ctx context.Context, terms []string) ([]*Repo, error) {
+	const hay = `(url || char(10) || notes || char(10) || tags || char(10) || description || char(10) || homepage ||
+		char(10) || topics || char(10) || readme_title || char(10) || links || char(10) || readme_text)`
+	var where []string
+	var args []any
+	for _, t := range terms {
+		if tag, ok := strings.CutPrefix(t, "#"); ok && tag != "" && !isDigits(tag) {
+			where = append(where, `(',' || tags || ',') LIKE ? ESCAPE '\'`)
+			args = append(args, "%,"+escapeLike(NormalizeTag(tag))+",%")
+			continue
+		}
+		where = append(where, hay+` LIKE ? ESCAPE '\'`)
+		args = append(args, "%"+escapeLike(t)+"%")
+	}
+	q := `SELECT ` + repoCols + ` FROM repos`
+	if len(where) > 0 {
+		q += ` WHERE ` + strings.Join(where, " AND ")
+	}
+	rows, err := s.db.QueryContext(ctx, q+` ORDER BY id`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Repo
+	for rows.Next() {
+		r, err := scanRepo(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+func escapeLike(s string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(s)
+}
+
+func isDigits(s string) bool {
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return s != ""
 }

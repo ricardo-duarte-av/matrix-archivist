@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 )
@@ -55,5 +56,62 @@ func TestMigrateFromV1(t *testing.T) {
 	s.SetUpstream(ctx, 1, "", "")
 	if r, _ = s.Repo(ctx, 1); r.Upstream != "" || !r.UpstreamSince.IsZero() {
 		t.Fatalf("after clear: %+v", r)
+	}
+}
+
+func TestSearchRepos(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "db.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	a, _ := s.AddRepo(ctx, "https://github.com/x/TheItalianJob", "github.com/x/theitalianjob", "a", "@u:x")
+	b, _ := s.AddRepo(ctx, "https://github.com/y/zelda3", "github.com/y/zelda3", "b", "@u:x")
+	c, _ := s.AddRepo(ctx, "https://github.com/z/other_100%", "github.com/z/other", "c", "@u:x")
+	s.SetReadme(ctx, a.ID, Readme{Title: "Mario", Summary: "Static recompilation", Text: "# Mario\nA Super Mario World recompilation for PC.", Links: []string{"discord.gg/abc"}})
+	s.SetForgeInfo(ctx, b.ID, "A reimplementation of Zelda 3", "https://zelda.example", []string{"snes", "zelda"}, true)
+	s.SetTags(ctx, b.ID, []string{"nintendo"})
+	s.SetTags(ctx, c.ID, []string{"nintendo-ds"})
+
+	ids := func(terms ...string) (out []int64) {
+		rs, err := s.SearchRepos(ctx, terms)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, r := range rs {
+			out = append(out, r.ID)
+		}
+		return
+	}
+	check := func(got []int64, want ...int64) {
+		t.Helper()
+		if fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	}
+	check(ids("super mario"), a.ID)    // README body
+	check(ids("MARIO", "world"), a.ID) // case-insensitive, AND
+	check(ids("mario", "zelda"))       // no repo has both
+	check(ids("discord.gg/abc"), a.ID) // links
+	check(ids("snes"), b.ID)           // topics
+	check(ids("#nintendo"), b.ID)      // exact tag, not nintendo-ds
+	check(ids("nintendo"), b.ID, c.ID) // substring of tags
+	check(ids("100%"), c.ID)           // % is literal
+	check(ids("y_z"))                  // _ is literal
+	check(ids("other_"), c.ID)
+
+	r, _ := s.Repo(ctx, b.ID)
+	if r.Description != "A reimplementation of Zelda 3" || r.Homepage != "https://zelda.example" || fmt.Sprint(r.Topics) != "[snes zelda]" || r.ForgeInfoAt.IsZero() {
+		t.Errorf("forge info not loaded: %+v", r)
+	}
+	r, _ = s.Repo(ctx, a.ID)
+	if r.ReadmeSummary != "Static recompilation" || fmt.Sprint(r.Links) != "[discord.gg/abc]" || r.ReadmeAt.IsZero() {
+		t.Errorf("readme not loaded: %+v", r)
+	}
+	// A failed forge lookup keeps the old data and records the attempt.
+	s.SetForgeInfo(ctx, b.ID, "", "", nil, false)
+	if r, _ := s.Repo(ctx, b.ID); r.Description == "" {
+		t.Error("failed lookup erased description")
 	}
 }

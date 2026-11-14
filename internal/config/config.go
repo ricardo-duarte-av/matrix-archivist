@@ -110,7 +110,6 @@ type Config struct {
 	FailureAlert     int      `yaml:"failure_alert_threshold"`
 	PruneDeleted     bool     `yaml:"prune_deleted"`
 	DiskWarnFreeRaw  string   `yaml:"disk_warn_free"`
-	ThreadReplies    bool     `yaml:"thread_replies"`
 	LogLevel         string   `yaml:"log_level"`
 	Summary          Summary  `yaml:"summary"`
 	Releases         Releases `yaml:"releases"`
@@ -134,7 +133,6 @@ func defaults() *Config {
 		GitTimeoutRaw:    "30m",
 		FailureAlert:     5,
 		DiskWarnFreeRaw:  "5GB",
-		ThreadReplies:    true,
 		LogLevel:         "info",
 		Summary: Summary{
 			Enabled:  true,

@@ -32,7 +32,7 @@ func init() {
 		"add":     {"add <url> [url…]", "Add git repositories to the archive", true, (*Bot).cmdAdd},
 		"remove":  {"remove <#id|url> [--purge]", "Stop tracking a repository (`--purge` also deletes its files)", true, (*Bot).cmdRemove},
 		"list":    {"list [tag]", "List tracked repositories, optionally only those with a tag", false, (*Bot).cmdList},
-		"search":  {"search <text|#tag>…", "Search repositories by URL, note and tags", false, (*Bot).cmdSearch},
+		"search":  {"search <text|#tag>…", "Search repositories by URL, description, README, notes and tags (best 50 shown)", false, (*Bot).cmdSearch},
 		"info":    {"info <#id|url>", "Details about a repository: state, recent commits, releases, snapshots", false, (*Bot).cmdInfo},
 		"note":    {"note <#id> [text|--clear]", "Show, set or clear a note on a repository (why it is archived)", true, (*Bot).cmdNote},
 		"tag":     {"tag <#id> <tag>…", "Add tags to a repository", true, (*Bot).cmdTag},
@@ -210,27 +210,11 @@ func (b *Bot) cmdList(evt *event.Event, args []string) {
 			return
 		}
 	}
-	const perMsg = 50
-	for i := 0; i < len(repos); i += perMsg {
-		end := min(i+perMsg, len(repos))
-		var sb strings.Builder
-		if i == 0 {
-			fmt.Fprintf(&sb, "**%s (%d):**\n\n", title, len(repos))
-		}
-		for _, r := range repos[i:end] {
-			sb.WriteString(repoLine(r))
-		}
-		b.reply(evt, sb.String())
+	rows := make([][]cell, len(repos))
+	for i, r := range repos {
+		rows[i] = repoRow(r)
 	}
-}
-
-// repoLine is a list entry: "- **#3** url — state · `tag`\n".
-func repoLine(r *store.Repo) string {
-	line := fmt.Sprintf("- **#%d** %s — %s", r.ID, r.URL, repoState(r))
-	for _, t := range r.Tags {
-		line += " · `" + t + "`"
-	}
-	return line + "\n"
+	b.replyRich(evt, TableMessages(fmt.Sprintf("**%s (%d)**", title, len(repos)), listHead, rows, "")...)
 }
 
 func repoState(r *store.Repo) string {
@@ -287,54 +271,54 @@ func (b *Bot) cmdRefresh(evt *event.Event, args []string) {
 			ok = ok && r.Err == nil
 		}
 		done(ok)
-		b.reply(evt, cycleReport(results))
+		b.replyRich(evt, cycleReport(results)...)
 		return
 	}
 	var repos []*store.Repo
-	var lines []string
+	var problems []string
 	for _, a := range args {
 		r, err := b.resolve(a)
 		if err != nil {
-			lines = append(lines, "- ❌ "+err.Error())
+			problems = append(problems, "- ❌ "+err.Error())
 			continue
 		}
 		repos = append(repos, r)
 	}
-	ok := len(lines) == 0
-	if len(repos) > 0 {
-		done := b.progress(evt)
-		for _, r := range repos {
-			res := b.arch.Check(b.ctx, r.ID)
-			ok = ok && res.Err == nil
-			lines = append(lines, fmt.Sprintf("- **#%d** %s: %s", r.ID, r.URL, res.Text()))
-		}
-		done(ok)
+	if len(problems) > 0 {
+		b.reply(evt, strings.Join(problems, "\n"))
 	}
-	b.reply(evt, strings.Join(lines, "\n"))
+	if len(repos) == 0 {
+		return
+	}
+	ok := len(problems) == 0
+	done := b.progress(evt)
+	var rows [][]cell
+	for _, r := range repos {
+		res := b.arch.Check(b.ctx, r.ID)
+		ok = ok && res.Err == nil
+		rows = append(rows, []cell{idCell(r), linkCell(r.URL, displayURL(r.URL)), mdCell(res.Text())})
+	}
+	done(ok)
+	b.replyRich(evt, TableMessages("", []string{"#", "Repository", "Result"}, rows, "")...)
 }
 
-func cycleReport(results []archiver.Result) string {
-	var changed, failed []string
+// cycleReport summarises a batch of checks: a count line and a table of changed and
+// failed repositories.
+func cycleReport(results []archiver.Result) []*rich {
+	var changed, failed [][]cell
 	for _, r := range results {
 		if r.Repo == nil {
 			continue
 		}
-		line := fmt.Sprintf("- **#%d** %s: %s", r.Repo.ID, r.Repo.URL, r.Text())
+		row := []cell{idCell(r.Repo), linkCell(r.Repo.URL, displayURL(r.Repo.URL)), mdCell(r.Text())}
 		if r.Err != nil {
-			failed = append(failed, line)
+			failed = append(failed, row)
 		} else if r.Changed() {
-			changed = append(changed, line)
+			changed = append(changed, row)
 		}
 	}
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "Refreshed %d repositories: %d changed, %d failed.\n", len(results), len(changed), len(failed))
-	if len(changed) > 0 {
-		sb.WriteString("\n" + strings.Join(changed, "\n") + "\n")
-	}
-	if len(failed) > 0 {
-		sb.WriteString("\n" + strings.Join(failed, "\n") + "\n")
-	}
-	return sb.String()
+	intro := fmt.Sprintf("Refreshed %d repositories: %d changed, %d failed.", len(results), len(changed), len(failed))
+	return TableMessages(intro, []string{"#", "Repository", "Result"}, append(changed, failed...), "")
 }
 
 func (b *Bot) cmdStatus(evt *event.Event, args []string) {
@@ -357,21 +341,21 @@ func (b *Bot) cmdStatus(evt *event.Event, args []string) {
 		}
 		used += r.SizeBytes
 	}
-	var sb strings.Builder
-	sb.WriteString("**Archivist status**\n\n")
-	fmt.Fprintf(&sb, "- Repositories: %d (%d failing, %d gone upstream)\n", len(repos), failing, gone)
-	fmt.Fprintf(&sb, "- Storage used: %s%s\n", gitops.HumanSize(used), freeSpaceText(b.cfg.StorageDir))
-	fmt.Fprintf(&sb, "- Check interval: %s\n", b.cfg.CheckInterval)
+	rows := [][]cell{
+		{textCell("Repositories"), textCell(fmt.Sprintf("%d (%d failing, %d gone upstream)", len(repos), failing, gone))},
+		{textCell("Storage used"), textCell(gitops.HumanSize(used) + freeSpaceText(b.cfg.StorageDir))},
+		{textCell("Check interval"), textCell(b.cfg.CheckInterval.String())},
+	}
 	if u := b.cfg.HTTP.BrowseURL(""); u != "" {
-		fmt.Fprintf(&sb, "- Browse: %s\n", u)
+		rows = append(rows, []cell{textCell("Browse"), linkCell(u, u)})
 	}
 	if b.cfg.Summary.Enabled {
 		s := b.cfg.Summary
 		next := archiver.NextSummary(time.Now(), s.Hour, s.Minute, s.Location)
-		fmt.Fprintf(&sb, "- Next summary: %s\n", next.Format("2006-01-02 15:04 MST"))
+		rows = append(rows, []cell{textCell("Next summary"), textCell(next.Format("2006-01-02 15:04 MST"))})
 	}
-	fmt.Fprintf(&sb, "- Uptime: %s\n", time.Since(b.start).Round(time.Second))
-	b.reply(evt, sb.String())
+	rows = append(rows, []cell{textCell("Uptime"), textCell(time.Since(b.start).Round(time.Second).String())})
+	b.replyRich(evt, (&rich{}).MD("**Archivist status**").Table(nil, rows))
 }
 
 func (b *Bot) cmdSummary(_ *event.Event, _ []string) {

@@ -162,24 +162,99 @@ func TestAlertContent(t *testing.T) {
 
 func TestReplyRelation(t *testing.T) {
 	plain := &event.Event{ID: "$cmd", Content: event.Content{Parsed: &event.MessageEventContent{MsgType: event.MsgText, Body: "!a list"}}}
-	if rel := ReplyRelation(plain, false); rel.GetReplyTo() != "$cmd" || rel.Type != "" {
-		t.Errorf("short reply: %+v", rel)
-	}
-	if rel := ReplyRelation(plain, true); rel.GetThreadParent() != "$cmd" || !rel.IsFallingBack {
-		t.Errorf("long reply should start a thread: %+v", rel)
+	if rel := ReplyRelation(plain); rel.GetReplyTo() != "$cmd" || rel.Type != "" {
+		t.Errorf("plain reply must not start a thread: %+v", rel)
 	}
 	inThread := &event.Event{ID: "$cmd2", Content: event.Content{Parsed: &event.MessageEventContent{
 		MsgType: event.MsgText, Body: "!a list",
 		RelatesTo: (&event.RelatesTo{}).SetThread("$root", "$x"),
 	}}}
-	for _, long := range []bool{false, true} {
-		rel := ReplyRelation(inThread, long)
-		if rel.GetThreadParent() != "$root" || rel.GetReplyTo() != "$cmd2" || rel.IsFallingBack {
-			t.Errorf("in-thread reply (long=%v): %+v", long, rel)
+	if rel := ReplyRelation(inThread); rel.GetThreadParent() != "$root" || rel.GetReplyTo() != "$cmd2" || rel.IsFallingBack {
+		t.Errorf("in-thread reply: %+v", rel)
+	}
+}
+
+func TestRepoTable(t *testing.T) {
+	r := &store.Repo{ID: 3, URL: "https://github.com/snesrev/zelda3", Cloned: true, Tags: []string{"zelda"},
+		ReadmeTitle: "Zelda3", ReadmeSummary: "A reimplementation of Zelda 3.",
+		Links: []string{"discord.gg/AJJbJAzNNJ"}, Homepage: "https://github.com/snesrev/zelda3"}
+	evil := &store.Repo{ID: 4, URL: "https://github.com/x/y", Description: `<img src=x onerror=alert(1)> **bold**`,
+		Homepage: "javascript:alert(1)"}
+	msgs := TableMessages("**Tracked (2)**", listHead, [][]cell{repoRow(r), repoRow(evil)}, "")
+	if len(msgs) != 1 {
+		t.Fatalf("%d messages", len(msgs))
+	}
+	c := msgs[0].Content()
+	for _, want := range []string{
+		"<p><strong>Tracked (2)</strong></p><table><thead><tr><th>#</th>",
+		`<td><a href="https://github.com/snesrev/zelda3">github.com/snesrev/zelda3</a> <code>zelda</code></td>`,
+		"<td>A reimplementation of Zelda 3.</td>",
+		`<td><a href="https://discord.gg/AJJbJAzNNJ">discord.gg/AJJbJAzNNJ</a></td>`,
+		"&lt;img src=x onerror=alert(1)&gt; **bold**",
+	} {
+		if !strings.Contains(c.FormattedBody, want) {
+			t.Errorf("HTML missing %q:\n%s", want, c.FormattedBody)
 		}
 	}
-	if IsLong("a\nb") || !IsLong(strings.Repeat("line\n", 20)) {
-		t.Error("IsLong")
+	if strings.Contains(c.FormattedBody, "javascript:") || strings.Contains(c.FormattedBody, "<img") {
+		t.Errorf("unsafe HTML:\n%s", c.FormattedBody)
+	}
+	if !strings.Contains(c.Body, "#3 · github.com/snesrev/zelda3 `zelda` · A reimplementation of Zelda 3. · discord.gg/AJJbJAzNNJ · ⏳") &&
+		!strings.Contains(c.Body, "#3 · github.com/snesrev/zelda3 `zelda` · A reimplementation of Zelda 3. · discord.gg/AJJbJAzNNJ · ✅") {
+		t.Errorf("text body:\n%s", c.Body)
+	}
+	if c.Mentions == nil || c.Mentions.Room {
+		t.Error("tables must not mention anyone")
+	}
+}
+
+func TestTableSplit(t *testing.T) {
+	var rows [][]cell
+	for i := range 1000 {
+		r := &store.Repo{ID: int64(i), URL: fmt.Sprintf("https://github.com/owner/repository-%d", i), Description: strings.Repeat("words ", 25)}
+		rows = append(rows, repoRow(r))
+	}
+	msgs := TableMessages("intro", listHead, rows, "outro")
+	if len(msgs) < 5 {
+		t.Fatalf("expected a split, got %d messages", len(msgs))
+	}
+	n := 0
+	for i, m := range msgs {
+		c := m.Content()
+		if len(c.Body)+len(c.FormattedBody) > maxRichBytes+2048 {
+			t.Errorf("message %d too big: %d", i, len(c.Body)+len(c.FormattedBody))
+		}
+		n += strings.Count(c.FormattedBody, "<tr><td>")
+		if (i == 0) != strings.Contains(c.Body, "intro") || (i == len(msgs)-1) != strings.Contains(c.Body, "outro") {
+			t.Errorf("intro/outro placement in message %d", i)
+		}
+	}
+	if n != 1000 {
+		t.Errorf("%d rows sent, want 1000", n)
+	}
+}
+
+func TestAboutAndRank(t *testing.T) {
+	r := &store.Repo{URL: "https://github.com/a/zelda3", ReadmeTitle: "Zelda3"}
+	if About(r) != "" {
+		t.Errorf("title equal to repo name is not a description: %q", About(r))
+	}
+	r.ReadmeSummary = "A reimplementation."
+	if About(r) != "A reimplementation." {
+		t.Error(About(r))
+	}
+	r.Description = "From the forge"
+	if About(r) != "From the forge" {
+		t.Error(About(r))
+	}
+	repos := []*store.Repo{
+		{ID: 1, URL: "https://github.com/x/readme-only"},
+		{ID: 2, URL: "https://github.com/x/other", Description: "Mario recompilation"},
+		{ID: 3, URL: "https://github.com/x/mario-recomp"},
+	}
+	got := RankRepos(repos, []string{"mario"})
+	if got[0].ID != 3 || got[1].ID != 2 || got[2].ID != 1 {
+		t.Errorf("rank: %d %d %d", got[0].ID, got[1].ID, got[2].ID)
 	}
 }
 

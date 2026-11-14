@@ -2,8 +2,8 @@ package web
 
 import (
 	"archive/zip"
-	"context"
 	"bytes"
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -179,7 +179,10 @@ func TestMetrics(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.Metrics = func(_ context.Context, w io.Writer) error { _, err := io.WriteString(w, "archivist_repos 3\n"); return err }
+	s.Metrics = func(_ context.Context, w io.Writer) error {
+		_, err := io.WriteString(w, "archivist_repos 3\n")
+		return err
+	}
 	srv := httptest.NewServer(s.Handler())
 	defer srv.Close()
 	resp, body := get(t, srv.URL+"/metrics")

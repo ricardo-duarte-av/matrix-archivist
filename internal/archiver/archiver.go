@@ -236,6 +236,8 @@ func (a *Archiver) finish(ctx context.Context, res Result, log zerolog.Logger) R
 			}
 			alerted = true
 		}
+		// Archives of repos that vanished upstream still get their README indexed.
+		a.updateMeta(ctx, res, false, log)
 		if n := repo.FailCount + 1; !alerted && a.cfg.FailureAlert > 0 && n == a.cfg.FailureAlert {
 			a.Alert(ctx, FailureAlertText(repo, n, res.Err))
 		}
@@ -270,6 +272,7 @@ func (a *Archiver) finish(ctx context.Context, res Result, log zerolog.Logger) R
 				_ = a.store.AddEvent(ctx, repo.ID, store.EventRelease, t)
 			}
 		}
+		a.updateMeta(ctx, res, true, log)
 		if text := RewriteNoticeText(repo, res.Change, res.branch); text != "" {
 			a.Notify(ctx, text)
 		}

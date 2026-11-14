@@ -23,7 +23,7 @@ The base command is set by `command_prefix` (default `!archivist`).
 | `!archivist add <url> [url…]` | PL ≥ `min_power_level` | Add repositories. Each is cloned straight away and the bot replies when done. |
 | `!archivist remove <#id\|url> [--purge]` | PL ≥ `min_power_level` | Stop tracking. Files stay on disk unless `--purge` is given. |
 | `!archivist list [tag]` | everyone | Tracked repositories with their `#id`, state and tags; optionally only those with a tag. |
-| `!archivist search <text\|#tag>…` | everyone | Find repositories by URL, note or tag. All terms must match. |
+| `!archivist search <text\|#tag>…` | everyone | Find repositories by URL, description, README, note, topic or tag. All terms must match; the best 50 are shown, name and description matches first. |
 | `!archivist info <#id\|url>` | everyone | Details: state, upstream status, note, recent commits, latest release, history snapshots, disk usage. |
 | `!archivist note <#id> [text\|--clear]` | PL ≥ `min_power_level` | Show, set or clear a note ("why we archived this"). |
 | `!archivist tag <#id> <tag>…` / `untag …` | PL ≥ `min_power_level` | Add or remove tags. |
@@ -38,7 +38,16 @@ The base command is set by `command_prefix` (default `!archivist`).
 Aliases: `ls`, `rm`/`del`, `update`/`pull`, `find`, `du`.
 
 While `add`, `refresh` and `import` run, the command gets a ⏳ reaction, replaced by ✅ or ❌ when done.
-Long replies go into a thread on the command (`thread_replies: false` turns this off); commands sent inside a thread are answered in that thread.
+Lists (`list`, `search`, `usage`, `refresh`) and `info`/`status` are sent as HTML tables, with a plain-text version for notifications and text-only clients. Long lists are split over several messages. Replies go to the main timeline; only a command sent inside a thread is answered in that thread.
+
+### What each repository is about
+
+Repository URLs say little ("TheItalianJob" may be a Mario port), so the bot collects a short description for each one:
+
+- From the forge (GitHub, Gitea/Forgejo/Codeberg, GitLab): description, homepage and topics. Fetched at most once a day per repository.
+- From the README in the checkout: the title, the first real paragraph, and community links (Discord, Matrix, Telegram, Reddit, Zulip, Libera, Patreon, Ko-fi). Re-read whenever the repository changes.
+
+`list` and `search` show the description and links next to each repository, and `info` shows all of it. The README text, up to 64 KB, is stored so `search` can find words that appear only in a README. Repositories gone upstream keep what was collected. Existing installs fill this in on the next check cycle.
 
 `#id` numbers are stable: removing #3 does not renumber #4.
 
@@ -170,7 +179,6 @@ See [`config.example.yaml`](config.example.yaml); every option is commented ther
 | `forges` | API tokens and self-hosted forges. A GitHub token is strongly recommended: without one the API allows 60 requests/hour. |
 | `prune_deleted` | Whether branches and tags deleted upstream are deleted from the archive too. Default `false`: they are kept. Either way they're snapshotted under `refs/archive/` first. |
 | `disk_warn_free` | @room alert when free space in `storage_dir` drops below this (default `5GB`). A notice follows when it recovers. |
-| `thread_replies` | Put long replies in a thread on the command (default `true`). |
 | `http.metrics`, `http.widget.*` | Prometheus endpoint, and the room widget. |
 
 ## Failure alerts

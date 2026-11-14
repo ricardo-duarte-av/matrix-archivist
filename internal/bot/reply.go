@@ -3,46 +3,37 @@ package bot
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"maunium.net/go/mautrix/crypto/attachment"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 )
 
-// Replies longer than this go into a thread (when thread_replies is on).
-const (
-	longReplyLines = 12
-	longReplyChars = 1500
-)
-
-// IsLong reports whether a reply is long enough to be moved into a thread.
-func IsLong(markdown string) bool {
-	return strings.Count(markdown, "\n") >= longReplyLines || len(markdown) > longReplyChars
-}
-
-// ReplyRelation decides where a reply to cmd goes: into cmd's thread if it was sent in one,
-// into a new thread on cmd if the reply is long, otherwise a plain reply.
-func ReplyRelation(cmd *event.Event, long bool) *event.RelatesTo {
-	var root id.EventID
+// ReplyRelation makes a reply to cmd. Replies stay in the main timeline; only a command
+// that was itself sent inside a thread is answered in that thread.
+func ReplyRelation(cmd *event.Event) *event.RelatesTo {
 	if msg := cmd.Content.AsMessage(); msg != nil {
-		root = msg.RelatesTo.GetThreadParent()
+		if root := msg.RelatesTo.GetThreadParent(); root != "" {
+			return (&event.RelatesTo{}).SetThread(root, "").SetReplyTo(cmd.ID)
+		}
 	}
-	switch {
-	case root != "":
-		return (&event.RelatesTo{}).SetThread(root, "").SetReplyTo(cmd.ID)
-	case long:
-		// Thread on the command; clients without thread support see a reply.
-		return (&event.RelatesTo{}).SetThread(cmd.ID, cmd.ID)
-	default:
-		return (&event.RelatesTo{}).SetReplyTo(cmd.ID)
+	return (&event.RelatesTo{}).SetReplyTo(cmd.ID)
+}
+
+// reply sends a Markdown message in reply to evt.
+func (b *Bot) reply(evt *event.Event, markdown string) {
+	b.send(evt, b.content(markdown))
+}
+
+// replyRich sends one or more rich (HTML table) messages in reply to evt.
+func (b *Bot) replyRich(evt *event.Event, msgs ...*rich) {
+	for _, m := range msgs {
+		b.send(evt, m.Content())
 	}
 }
 
-// reply sends a message in reply to evt.
-func (b *Bot) reply(evt *event.Event, markdown string) {
-	c := b.content(markdown)
-	c.RelatesTo = ReplyRelation(evt, b.cfg.ThreadReplies && IsLong(markdown))
+func (b *Bot) send(evt *event.Event, c *event.MessageEventContent) {
+	c.RelatesTo = ReplyRelation(evt)
 	if _, err := b.client.SendMessageEvent(b.ctx, b.roomID, event.EventMessage, c); err != nil {
 		b.log.Err(err).Msg("Failed to send reply")
 	}
@@ -91,7 +82,7 @@ func (b *Bot) sendFile(evt *event.Event, name, mime string, data []byte) error {
 		}
 		c.URL = resp.ContentURI.CUString()
 	}
-	c.RelatesTo = ReplyRelation(evt, false)
+	c.RelatesTo = ReplyRelation(evt)
 	_, err := b.client.SendMessageEvent(b.ctx, b.roomID, event.EventMessage, c)
 	return err
 }

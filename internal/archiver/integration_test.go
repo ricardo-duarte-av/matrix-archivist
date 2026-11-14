@@ -61,6 +61,13 @@ releases: {max_asset_size: 200KB}
 		if _, err := os.Stat(filepath.Join(a.checkoutDir(r), ".git")); err != nil {
 			t.Errorf("%s: no checkout", raw)
 		}
+		if m, _ := st.Repo(ctx, r.ID); m != nil {
+			t.Logf("%s: description=%q homepage=%q topics=%v readme title=%q summary=%q links=%v",
+				raw, m.Description, m.Homepage, m.Topics, m.ReadmeTitle, m.ReadmeSummary, m.Links)
+			if m.ReadmeAt.IsZero() || m.ForgeInfoAt.IsZero() {
+				t.Errorf("%s: metadata not collected", raw)
+			}
+		}
 		res = a.Check(ctx, r.ID)
 		t.Logf("%s (2nd): %s", raw, res.Text())
 		if res.Err != nil || res.Changed() {

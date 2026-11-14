@@ -41,8 +41,6 @@ failure_alert_threshold: 5
 prune_deleted: false
 # Post an @room alert when free space in storage_dir drops below this (0 = off).
 disk_warn_free: 5GB
-# Put long replies (list, info, search, …) in a thread on the command instead of the main timeline.
-thread_replies: true
 log_level: info           # debug, info, warn, error
 
 summary:

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"slices"
 	"sort"
 	"strings"
@@ -54,35 +55,39 @@ func isDigits(s string) bool {
 	return s != ""
 }
 
+// searchLimit caps how many search results are shown.
+const searchLimit = 50
+
 func (b *Bot) cmdSearch(evt *event.Event, args []string) {
 	if len(args) == 0 {
 		b.reply(evt, fmt.Sprintf("Usage: `%s search <text|#tag>…`", b.cfg.CommandPrefix))
 		return
 	}
-	repos, err := b.store.Repos(b.ctx)
+	found, err := b.store.SearchRepos(b.ctx, args)
 	if err != nil {
 		b.reply(evt, "❌ "+err.Error())
 		return
 	}
-	found := FilterRepos(repos, args)
 	if len(found) == 0 {
 		b.reply(evt, "No repositories match.")
 		return
 	}
-	const max = 50
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "**%d matching repositories:**\n\n", len(found))
+	found = RankRepos(found, args)
+	intro := fmt.Sprintf("**%d matching repositories**", len(found))
+	outro := ""
+	if len(found) > searchLimit {
+		intro = fmt.Sprintf("**%d matching repositories** (best %d shown)", len(found), searchLimit)
+		outro = fmt.Sprintf("_…and %d more; add more words to narrow the search._", len(found)-searchLimit)
+		found = found[:searchLimit]
+	}
+	rows := make([][]cell, len(found))
 	for i, r := range found {
-		if i == max {
-			fmt.Fprintf(&sb, "\n_…and %d more; narrow the search._\n", len(found)-max)
-			break
-		}
-		sb.WriteString(repoLine(r))
+		rows[i] = repoRow(r)
 		if r.Notes != "" {
-			fmt.Fprintf(&sb, "  _%s_\n", oneLineMD(r.Notes, 120))
+			rows[i][2] = joinCells(" — ", rows[i][2], cell{"<em>" + html.EscapeString(oneLineMD(r.Notes, 120)) + "</em>", oneLineMD(r.Notes, 120)})
 		}
 	}
-	b.reply(evt, sb.String())
+	b.replyRich(evt, TableMessages(intro, listHead, rows, outro)...)
 }
 
 func (b *Bot) cmdInfo(evt *event.Event, args []string) {
@@ -99,51 +104,71 @@ func (b *Bot) cmdInfo(evt *event.Event, args []string) {
 	nrel, _ := b.store.ReleaseCount(b.ctx, r.ID)
 	latest, published, _ := b.store.LatestRelease(b.ctx, r.ID)
 
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "**#%d** %s", r.ID, r.URL)
-	for _, t := range r.Tags {
-		sb.WriteString(" · `" + t + "`")
+	m := &rich{}
+	head := fmt.Sprintf("**#%d** %s", r.ID, r.URL)
+	if about := About(r); about != "" {
+		head += "  \n" + oneLineMD(about, 300)
 	}
-	sb.WriteString("\n\n")
+	m.MD(head)
 	if r.Notes != "" {
-		fmt.Fprintf(&sb, "> %s\n\n", strings.ReplaceAll(r.Notes, "\n", "\n> "))
+		m.MD("> " + strings.ReplaceAll(r.Notes, "\n", "\n> "))
 	}
-	fmt.Fprintf(&sb, "- State: %s\n", repoState(r))
+
+	kv := func(k string, v cell) []cell { return []cell{cell{"<strong>" + k + "</strong>", k}, v} }
+	rows := [][]cell{kv("State", textCell(repoState(r)))}
 	if r.Upstream != "" {
-		fmt.Fprintf(&sb, "- Upstream: %s since %s\n", r.UpstreamDetail, r.UpstreamSince.Format("2006-01-02 15:04 MST"))
+		rows = append(rows, kv("Upstream", textCell(fmt.Sprintf("%s since %s", r.UpstreamDetail, r.UpstreamSince.Format("2006-01-02 15:04 MST")))))
 	}
-	fmt.Fprintf(&sb, "- Added by %s, %s\n", r.AddedBy, ago(r.AddedAt))
-	fmt.Fprintf(&sb, "- Last checked: %s · last changed: %s\n", ago(r.LastChecked), ago(r.LastChanged))
+	if links := linksCell(r); links.text != "" {
+		rows = append(rows, kv("Links", links))
+	}
+	if len(r.Tags) > 0 {
+		rows = append(rows, kv("Tags", mdCell("`"+strings.Join(r.Tags, "` `")+"`")))
+	}
+	if len(r.Topics) > 0 {
+		rows = append(rows, kv("Topics", textCell(strings.Join(r.Topics, ", "))))
+	}
+	rows = append(rows,
+		kv("Added", textCell(fmt.Sprintf("by %s, %s", r.AddedBy, ago(r.AddedAt)))),
+		kv("Checked", textCell(fmt.Sprintf("%s · last changed %s", ago(r.LastChecked), ago(r.LastChanged)))))
 	if d.Branch != "" {
-		fmt.Fprintf(&sb, "- Default branch: `%s`\n", d.Branch)
+		rows = append(rows, kv("Default branch", mdCell("`"+d.Branch+"`")))
 	}
 	if nrel > 0 {
-		fmt.Fprintf(&sb, "- Releases archived: %d (latest: %s, %s)\n", nrel, latest, published.Format("2006-01-02"))
+		rows = append(rows, kv("Releases", textCell(fmt.Sprintf("%d archived (latest: %s, %s)", nrel, latest, published.Format("2006-01-02")))))
 	} else {
-		sb.WriteString("- Releases archived: 0\n")
+		rows = append(rows, kv("Releases", textCell("none archived")))
 	}
 	if n := len(d.Snapshots); n > 0 {
 		refs := 0
 		for _, s := range d.Snapshots {
 			refs += s.Refs
 		}
-		fmt.Fprintf(&sb, "- History snapshots: %d (%d refs preserved from rewrites/deletions, latest `refs/archive/%s`)\n",
-			n, refs, d.Snapshots[n-1].Stamp)
+		rows = append(rows, kv("History snapshots", mdCell(fmt.Sprintf("%d (%d refs preserved from rewrites/deletions, latest `refs/archive/%s`)", n, refs, d.Snapshots[n-1].Stamp))))
 	}
-	fmt.Fprintf(&sb, "- Disk usage: %s (`%s`)\n", gitops.HumanSize(gitops.DirSize(b.arch.RepoDir(r))), r.RelDir)
+	rows = append(rows, kv("Disk usage", mdCell(fmt.Sprintf("%s (`%s`)", gitops.HumanSize(gitops.DirSize(b.arch.RepoDir(r))), r.RelDir))))
 	if u := b.cfg.HTTP.BrowseURL(r.RelDir); u != "" {
-		fmt.Fprintf(&sb, "- Browse: %s\n", u)
+		rows = append(rows, kv("Browse", linkCell(u, u)))
 	}
 	if r.LastError != "" {
-		fmt.Fprintf(&sb, "- Last error: `%s`\n", strings.ReplaceAll(oneLineMD(r.LastError, 300), "`", "'"))
+		rows = append(rows, kv("Last error", cell{"<code>" + html.EscapeString(oneLineMD(r.LastError, 300)) + "</code>", oneLineMD(r.LastError, 300)}))
 	}
+	m.Table(nil, rows)
+
 	if len(d.Commits) > 0 {
-		sb.WriteString("\n**Recent commits:**\n\n")
+		m.MD("**Recent commits**")
+		var cs [][]cell
 		for _, c := range d.Commits {
-			fmt.Fprintf(&sb, "- `%s` %s — %s, %s\n", c.Hash, oneLineMD(c.Subject, 100), oneLineMD(c.Author, 40), ago(c.Time))
+			cs = append(cs, []cell{
+				{"<code>" + html.EscapeString(c.Hash) + "</code>", c.Hash},
+				textCell(oneLineMD(c.Subject, 100)),
+				textCell(oneLineMD(c.Author, 40)),
+				textCell(ago(c.Time)),
+			})
 		}
+		m.Table([]string{"Commit", "Subject", "Author", "When"}, cs)
 	}
-	b.reply(evt, sb.String())
+	b.replyRich(evt, m)
 }
 
 func (b *Bot) cmdNote(evt *event.Event, args []string) {
@@ -254,22 +279,22 @@ func (b *Bot) cmdUsage(evt *event.Event, _ []string) {
 	for _, r := range repos {
 		total += r.SizeBytes
 	}
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "**Disk usage:** %s in %d repositories%s\n\n", gitops.HumanSize(total), len(repos), freeSpaceText(b.cfg.StorageDir))
+	intro := fmt.Sprintf("**Disk usage:** %s in %d repositories%s", gitops.HumanSize(total), len(repos), freeSpaceText(b.cfg.StorageDir))
 	const max = 25
+	outro := "_Sizes are measured after each change._"
+	if len(repos) > max {
+		outro = fmt.Sprintf("_…and %d smaller ones. Sizes are measured after each change._", len(repos)-max)
+		repos = repos[:max]
+	}
+	rows := make([][]cell, len(repos))
 	for i, r := range repos {
-		if i == max {
-			fmt.Fprintf(&sb, "\n_…and %d smaller ones._\n", len(repos)-max)
-			break
-		}
 		pct := 0.0
 		if total > 0 {
 			pct = float64(r.SizeBytes) * 100 / float64(total)
 		}
-		fmt.Fprintf(&sb, "- %s (%.0f%%) — **#%d** %s\n", gitops.HumanSize(r.SizeBytes), pct, r.ID, r.URL)
+		rows[i] = []cell{idCell(r), linkCell(r.URL, displayURL(r.URL)), textCell(gitops.HumanSize(r.SizeBytes)), textCell(fmt.Sprintf("%.0f%%", pct))}
 	}
-	sb.WriteString("\n_Sizes are measured after each change._")
-	b.reply(evt, sb.String())
+	b.replyRich(evt, TableMessages(intro, []string{"#", "Repository", "Size", "Share"}, rows, outro)...)
 }
 
 // freeSpaceText is ", 120.3 GiB free of 500.0 GiB" or "" if unknown.
@@ -434,7 +459,7 @@ func (b *Bot) cmdImport(evt *event.Event, _ []string) {
 		}
 	}
 	done(failed == 0 && invalid == 0)
-	b.reply(evt, cycleReport(results))
+	b.replyRich(evt, cycleReport(results)...)
 }
 
 // oneLineMD flattens text to a single line, trimmed to max runes.
