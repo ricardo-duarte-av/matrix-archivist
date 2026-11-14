@@ -115,6 +115,9 @@ func (g *Git) runInput(ctx context.Context, dir, stdin string, args ...string) (
 		cmd.Stdin = strings.NewReader(stdin)
 	}
 	cmd.Dir = dir
+	killTree(cmd)
+	// Don't wait forever for output pipes held open by a straggling process.
+	cmd.WaitDelay = 10 * time.Second
 	cmd.Env = append(os.Environ(),
 		"GIT_TERMINAL_PROMPT=0",
 		"GIT_ASKPASS=",

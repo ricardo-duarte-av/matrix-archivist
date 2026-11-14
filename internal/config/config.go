@@ -41,9 +41,18 @@ type Releases struct {
 	DownloadAssets     bool   `yaml:"download_assets"`
 	MaxAssetSizeRaw    string `yaml:"max_asset_size"`
 	IncludePrereleases bool   `yaml:"include_prereleases"`
+	// KeepLast keeps only the newest N releases per repository (0 = all).
+	KeepLast int `yaml:"keep_last"`
+	// MaxRepoSizeRaw caps a repository's total size (git data + releases); the oldest
+	// releases are removed to stay under it, but the newest is always kept. "" or 0 = unlimited.
+	MaxRepoSizeRaw string `yaml:"max_repo_size"`
 
 	MaxAssetSize int64 `yaml:"-"`
+	MaxRepoSize  int64 `yaml:"-"`
 }
+
+// Limited reports whether any release retention limit is set.
+func (r Releases) Limited() bool { return r.KeepLast > 0 || r.MaxRepoSize > 0 }
 
 type Forge struct {
 	Host  string `yaml:"host"`
@@ -255,6 +264,12 @@ func (c *Config) validate() error {
 
 	if c.Releases.MaxAssetSize, err = ParseSize(c.Releases.MaxAssetSizeRaw); err != nil {
 		add("releases.max_asset_size: %v", err)
+	}
+	if c.Releases.MaxRepoSize, err = ParseSize(c.Releases.MaxRepoSizeRaw); err != nil {
+		add("releases.max_repo_size: %v", err)
+	}
+	if c.Releases.KeepLast < 0 {
+		add("releases.keep_last must be 0 (all) or more")
 	}
 
 	if c.HTTP.Enabled {

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -40,6 +41,8 @@ type Archiver struct {
 
 	cycleRunning atomic.Bool
 
+	activity sync.Map // repo id → activity
+
 	// Counters exposed as metrics.
 	checksOK, checksFailed atomic.Int64
 	lastCycleEnd           atomic.Int64 // unix seconds
@@ -56,6 +59,28 @@ func New(cfg *config.Config, st *store.Store, log zerolog.Logger) *Archiver {
 		locks:  map[int64]*sync.Mutex{},
 		Notify: func(context.Context, string) {},
 		Alert:  func(context.Context, string) {},
+	}
+}
+
+type activity struct {
+	what  string
+	since time.Time
+}
+
+func (a *Archiver) setActivity(id int64, what string) {
+	since := time.Now()
+	if old, ok := a.activity.Load(id); ok {
+		since = old.(activity).since // time since the check started
+	}
+	a.activity.Store(id, activity{what, since})
+}
+
+// Annotate fills in Activity for repositories that are being checked right now.
+func (a *Archiver) Annotate(repos ...*store.Repo) {
+	for _, r := range repos {
+		if v, ok := a.activity.Load(r.ID); ok {
+			r.Activity, r.ActivitySince = v.(activity).what, v.(activity).since
+		}
 	}
 }
 
@@ -84,9 +109,11 @@ type Result struct {
 	Cloned      bool // first clone happened in this check
 	Change      gitops.Change
 	NewReleases []string
-	Err         error // git error (fatal for this check)
-	Warnings    []string
-	Preserved   int // refs saved under refs/archive because upstream rewrote/deleted them
+	// PrunedReleases were removed to respect releases.keep_last / max_repo_size.
+	PrunedReleases []string
+	Err            error // git error (fatal for this check)
+	Warnings       []string
+	Preserved      int // refs saved under refs/archive because upstream rewrote/deleted them
 
 	url    gitops.RepoURL
 	urlOK  bool
@@ -108,6 +135,9 @@ func (r Result) Text() string {
 	}
 	if n := len(r.NewReleases); n > 0 {
 		parts = append(parts, releasesText(r.NewReleases))
+	}
+	if n := len(r.PrunedReleases); n > 0 {
+		parts = append(parts, fmt.Sprintf("removed %d old release(s) to stay within the release limits", n))
 	}
 	if len(parts) == 0 {
 		parts = append(parts, "up to date")
@@ -143,6 +173,12 @@ func (a *Archiver) Check(ctx context.Context, id int64) Result {
 	m := a.lock(id)
 	m.Lock()
 	defer m.Unlock()
+	return a.check(ctx, id)
+}
+
+// check does the work of Check; the caller holds the repo's lock.
+func (a *Archiver) check(ctx context.Context, id int64) Result {
+	defer a.activity.Delete(id)
 
 	repo, err := a.store.Repo(ctx, id)
 	if err != nil {
@@ -164,12 +200,15 @@ func (a *Archiver) Check(ctx context.Context, id int64) Result {
 	mirror := a.mirrorDir(repo)
 	if _, statErr := os.Stat(mirror); errors.Is(statErr, os.ErrNotExist) {
 		log.Info().Msg("Cloning repository")
+		a.setActivity(id, "cloning")
 		if err := a.git.CloneMirror(gctx, repo.URL, mirror); err != nil {
 			res.Err = err
 			return a.finish(ctx, res, log)
 		}
 		res.Cloned = true
+		_ = a.store.MarkCloned(ctx, id)
 	} else {
+		a.setActivity(id, "fetching")
 		before, err := a.git.SnapshotRefs(gctx, mirror)
 		if err != nil {
 			res.Err = err
@@ -206,8 +245,8 @@ func (a *Archiver) Check(ctx context.Context, id int64) Result {
 	}
 
 	if a.cfg.Releases.Enabled {
-		tags, warns := a.archiveReleases(ctx, repo, u, log)
-		res.NewReleases = tags
+		tags, pruned, warns := a.archiveReleases(ctx, repo, u, log)
+		res.NewReleases, res.PrunedReleases = tags, pruned
 		res.Warnings = append(res.Warnings, warns...)
 	}
 	return a.finish(ctx, res, log)
@@ -254,7 +293,7 @@ func (a *Archiver) finish(ctx context.Context, res Result, log zerolog.Logger) R
 				a.Notify(ctx, fmt.Sprintf("✅ **#%d** %s is working again after %d failed checks.", repo.ID, repo.URL, repo.FailCount))
 			}
 		}
-		if res.Changed() || repo.SizeBytes == 0 {
+		if res.Changed() || len(res.PrunedReleases) > 0 || repo.SizeBytes == 0 {
 			_ = a.store.SetSize(ctx, repo.ID, gitops.DirSize(a.RepoDir(repo)))
 		}
 		if res.Cloned {
@@ -387,31 +426,37 @@ func (a *Archiver) provider(ctx context.Context, host string) forge.Provider {
 	return p
 }
 
-func (a *Archiver) archiveReleases(ctx context.Context, repo *store.Repo, u gitops.RepoURL, log zerolog.Logger) (newTags, warnings []string) {
+func (a *Archiver) archiveReleases(ctx context.Context, repo *store.Repo, u gitops.RepoURL, log zerolog.Logger) (newTags, pruned, warnings []string) {
 	if u.Owner == "" {
-		return nil, nil
+		return nil, nil, nil
 	}
 	p := a.provider(ctx, u.Host)
 	if p == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	rels, err := p.ListReleases(ctx, u.Owner, u.Name)
 	if errors.Is(err, forge.ErrNoRepo) {
-		return nil, nil
+		return nil, nil, nil
 	} else if err != nil {
 		log.Warn().Err(err).Msg("Failed to list releases")
-		return nil, []string{"releases: " + oneLine(err.Error())}
+		return nil, nil, []string{"releases: " + oneLine(err.Error())}
 	}
-	for _, rel := range rels {
-		if rel.Draft || rel.Tag == "" || (rel.Prerelease && !a.cfg.Releases.IncludePrereleases) {
-			continue
+	cands, err := a.releaseCandidates(ctx, repo, rels)
+	if err != nil {
+		return nil, nil, []string{"releases: " + oneLine(err.Error())}
+	}
+	var todo []ReleaseCandidate
+	for _, c := range a.planReleases(repo, cands) {
+		if !c.Archived {
+			todo = append(todo, c)
 		}
-		if done, err := a.store.HasRelease(ctx, repo.ID, rel.Tag); err != nil || done {
-			continue
-		}
+	}
+	for i, c := range todo {
 		if ctx.Err() != nil {
 			break
 		}
+		rel := *c.Release
+		a.setActivity(repo.ID, fmt.Sprintf("archiving releases (%d/%d: %s)", i+1, len(todo), rel.Tag))
 		dir := filepath.Join(a.releasesDir(repo), forge.SafeName(rel.Tag))
 		complete, skipped, err := a.saveRelease(ctx, rel, dir)
 		if err != nil {
@@ -428,11 +473,17 @@ func (a *Archiver) archiveReleases(ctx context.Context, repo *store.Repo, u gito
 			log.Info().Str("tag", rel.Tag).Msg("Archived release")
 		}
 	}
-	return newTags, warnings
+	if a.cfg.Releases.Limited() && ctx.Err() == nil {
+		// Re-plan with the real sizes now on disk and remove what no longer fits.
+		pruned, err = a.pruneReleases(ctx, repo, rels, log)
+		if err != nil {
+			warnings = append(warnings, "pruning releases: "+oneLine(err.Error()))
+		}
+		newTags = slices.DeleteFunc(newTags, func(t string) bool { return slices.Contains(pruned, t) })
+	}
+	return newTags, pruned, warnings
 }
 
-// saveRelease writes metadata and downloads assets. complete is false if some asset failed
-// in a retryable way (the release will be retried on the next check).
 func (a *Archiver) saveRelease(ctx context.Context, rel forge.Release, dir string) (complete bool, skipped []string, err error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return false, nil, err
@@ -513,7 +564,16 @@ func (a *Archiver) CheckMany(ctx context.Context, ids []int64) (results []Result
 		go func() {
 			defer wg.Done()
 			for id := range jobs {
-				out <- a.Check(ctx, id)
+				// A repo still busy with an earlier check (e.g. hours of release downloads
+				// after `add`) is skipped instead of holding up the whole cycle.
+				m := a.lock(id)
+				if !m.TryLock() {
+					a.log.Debug().Int64("repo_id", id).Msg("Skipping repository that is still being checked")
+					continue
+				}
+				res := a.check(ctx, id)
+				m.Unlock()
+				out <- res
 			}
 		}()
 	}

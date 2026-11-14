@@ -196,6 +196,7 @@ func (b *Bot) cmdList(evt *event.Event, args []string) {
 		b.reply(evt, "❌ "+err.Error())
 		return
 	}
+	b.arch.Annotate(repos...)
 	if len(repos) == 0 {
 		b.reply(evt, fmt.Sprintf("No repositories tracked yet. Add one with `%s add <url>`.", b.cfg.CommandPrefix))
 		return
@@ -219,6 +220,8 @@ func (b *Bot) cmdList(evt *event.Event, args []string) {
 
 func repoState(r *store.Repo) string {
 	switch {
+	case r.Activity != "":
+		return fmt.Sprintf("🔄 %s, started %s", r.Activity, ago(r.ActivitySince))
 	case r.Upstream == store.UpstreamLegal:
 		return fmt.Sprintf("⚖️ taken down upstream %s, archive preserved", ago(r.UpstreamSince))
 	case r.Upstream == store.UpstreamBlocked:

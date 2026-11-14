@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 
@@ -115,4 +116,41 @@ func TestRewriteNotice(t *testing.T) {
 			t.Errorf("notice missing %q: %s", want, s)
 		}
 	}
+}
+
+// A repo busy with a long check (release downloads after add) shows its activity and is
+// skipped by cycles instead of blocking them.
+func TestBusyRepoSkipped(t *testing.T) {
+	tmp := t.TempDir()
+	st, err := store.Open(filepath.Join(tmp, "db.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cfg, _ := config.Parse([]byte(`
+matrix: {homeserver: "https://m.example.org", user_id: "@b:example.org", password: x, room_id: "!r:example.org", pickle_key: k}
+storage_dir: ` + filepath.Join(tmp, "repos") + `
+releases: {enabled: false}
+`))
+	a := New(cfg, st, zerolog.Nop())
+	ctx := context.Background()
+	r, _ := st.AddRepo(ctx, "https://git.invalid/o/r", "git.invalid/o/r", "git.invalid/o/r", "@u:x")
+	m := a.lock(r.ID)
+	m.Lock()
+	a.setActivity(r.ID, "archiving releases (3/40: v1)")
+	a.Annotate(r)
+	if r.Activity != "archiving releases (3/40: v1)" || r.ActivitySince.IsZero() {
+		t.Errorf("activity: %+v", r)
+	}
+	done := make(chan []Result)
+	go func() { done <- a.CheckMany(ctx, []int64{r.ID}) }()
+	select {
+	case res := <-done:
+		if len(res) != 0 {
+			t.Errorf("busy repo was checked: %v", res)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cycle blocked on a busy repo")
+	}
+	m.Unlock()
 }

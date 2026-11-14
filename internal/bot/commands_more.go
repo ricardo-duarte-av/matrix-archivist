@@ -73,6 +73,7 @@ func (b *Bot) cmdSearch(evt *event.Event, args []string) {
 		return
 	}
 	found = RankRepos(found, args)
+	b.arch.Annotate(found...)
 	intro := fmt.Sprintf("**%d matching repositories**", len(found))
 	outro := ""
 	if len(found) > searchLimit {
@@ -100,6 +101,7 @@ func (b *Bot) cmdInfo(evt *event.Event, args []string) {
 		b.reply(evt, "❌ "+err.Error())
 		return
 	}
+	b.arch.Annotate(r)
 	d := b.arch.Details(b.ctx, r, 5)
 	nrel, _ := b.store.ReleaseCount(b.ctx, r.ID)
 	latest, published, _ := b.store.LatestRelease(b.ctx, r.ID)

@@ -54,6 +54,11 @@ releases:
   download_assets: true
   max_asset_size: 2GB     # larger assets are skipped (0 = unlimited)
   include_prereleases: true
+  # Retention (both optional, 0 = unlimited). Releases are ranked newest first; only the
+  # newest keep_last are kept, and older ones are removed while the repository (git data +
+  # releases) is larger than max_repo_size. The newest release is always kept.
+  keep_last: 10
+  max_repo_size: 2GB
 
 # Read-only web file browser for storage_dir: download single files, or whole folders as zip.
 http:

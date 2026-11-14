@@ -175,7 +175,7 @@ See [`config.example.yaml`](config.example.yaml); every option is commented ther
 | `min_power_level` | Power level needed for add, remove and refresh. |
 | `check_interval` | How often every repository is checked. |
 | `summary.time` / `summary.timezone` | When the daily summary is posted. |
-| `releases.*` | Release archiving, asset downloads, size cap, prereleases. |
+| `releases.*` | Release archiving, asset downloads, per-asset size cap, prereleases, retention (`keep_last`, `max_repo_size`). |
 | `forges` | API tokens and self-hosted forges. A GitHub token is strongly recommended: without one the API allows 60 requests/hour. |
 | `prune_deleted` | Whether branches and tags deleted upstream are deleted from the archive too. Default `false`: they are kept. Either way they're snapshotted under `refs/archive/` first. |
 | `disk_warn_free` | @room alert when free space in `storage_dir` drops below this (default `5GB`). A notice follows when it recovers. |
@@ -189,7 +189,8 @@ For @room to notify anyone, the bot needs the room's "Notify everyone" power lev
 
 ## Notes
 
-- **First sync can take a while** for projects with many releases and large assets (a CLI with 30 binaries × 300 releases, for example). Use `releases.max_asset_size` or `download_assets: false` to limit this.
+- **Release retention.** By default every release is kept. `releases.keep_last: 10` keeps only the newest 10. `releases.max_repo_size: 2GB` removes the oldest releases while a repository (git data plus releases) is bigger than that, but always keeps the newest one. Releases outside these limits are never downloaded. Archived ones are deleted when a new release pushes them out, or when you tighten the limits. Raising the limits downloads them again. A release deleted upstream counts like any other, so it stays archived while it is among the newest. Git history is never removed.
+- **First sync can take a while** for projects with many releases and large assets. While it runs, `list` shows progress (`🔄 archiving releases (3/10: v1.2)`). Use the retention limits above, `releases.max_asset_size`, or `download_assets: false` to limit this.
 - **The bot's device is unverified,** so Element may show a shield warning on its messages. That is harmless.
 - **Git LFS objects are not archived**; only the LFS pointer files are.
 

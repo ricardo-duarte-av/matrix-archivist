@@ -52,6 +52,11 @@ type Repo struct {
 	Links         []string
 	ReadmeAt      time.Time
 	ForgeInfoAt   time.Time
+
+	// Activity describes a check in progress ("archiving releases (3/40)"). Not stored;
+	// filled in by the archiver.
+	Activity      string
+	ActivitySince time.Time
 }
 
 const (
@@ -350,6 +355,13 @@ func (s *Store) RemoveRepo(ctx context.Context, id int64) error {
 	return nil
 }
 
+// MarkCloned records that the archive clone exists, before the rest of the first check
+// (release downloads) has finished.
+func (s *Store) MarkCloned(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE repos SET cloned = 1 WHERE id = ?`, id)
+	return err
+}
+
 // MarkChecked records the outcome of a check. A nil checkErr resets the failure counter.
 func (s *Store) MarkChecked(ctx context.Context, id int64, changed bool, checkErr error) error {
 	now := time.Now().Unix()
@@ -443,6 +455,39 @@ func (s *Store) LatestRelease(ctx context.Context, repoID int64) (tag string, pu
 		return "", time.Time{}, nil
 	}
 	return tag, fromUnix(ts), err
+}
+
+// ArchivedRelease is a release recorded as fully archived.
+type ArchivedRelease struct {
+	Tag       string
+	Name      string
+	Published time.Time
+}
+
+// ArchivedReleases lists a repository's archived releases.
+func (s *Store) ArchivedReleases(ctx context.Context, repoID int64) ([]ArchivedRelease, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT tag, name, published_at FROM releases WHERE repo_id = ?`, repoID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ArchivedRelease
+	for rows.Next() {
+		var r ArchivedRelease
+		var ts int64
+		if err := rows.Scan(&r.Tag, &r.Name, &ts); err != nil {
+			return nil, err
+		}
+		r.Published = fromUnix(ts)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// RemoveRelease forgets an archived release (its files are deleted by the caller).
+func (s *Store) RemoveRelease(ctx context.Context, repoID int64, tag string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM releases WHERE repo_id = ? AND tag = ?`, repoID, tag)
+	return err
 }
 
 func (s *Store) ReleaseCount(ctx context.Context, repoID int64) (int, error) {
