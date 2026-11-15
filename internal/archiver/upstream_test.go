@@ -5,15 +5,18 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/rs/zerolog"
 
 	"github.com/ricardo-duarte-av/matrix-archivist/internal/config"
+	"github.com/ricardo-duarte-av/matrix-archivist/internal/forge"
 	"github.com/ricardo-duarte-av/matrix-archivist/internal/gitops"
 	"github.com/ricardo-duarte-av/matrix-archivist/internal/store"
 )
@@ -161,5 +164,75 @@ releases: {enabled: false}
 	a.Annotate(r)
 	if r.Activity != "" {
 		t.Errorf("activity after end: %q", r.Activity)
+	}
+}
+
+// Once a repo is flagged gone, later checks only probe: no fetch, no error, no fail count
+// growth, no feed noise. When the probe says it's back, the fetch runs again.
+func TestGoneRepoSkipsFetch(t *testing.T) {
+	var status atomic.Int32
+	status.Store(http.StatusUnavailableForLegalReasons)
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(int(status.Load()))
+		fmt.Fprint(w, `{"message":"blocked","block":{"reason":"dmca"}}`)
+	}))
+	defer api.Close()
+
+	ctx := context.Background()
+	tmp := t.TempDir()
+	st, err := store.Open(filepath.Join(tmp, "db.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cfg, err := config.Parse([]byte(fmt.Sprintf(`
+matrix: {homeserver: "https://m.example.org", user_id: "@b:example.org", password: x, room_id: "!r:example.org", pickle_key: k}
+allow_internal_hosts: true # fake forge on 127.0.0.1
+storage_dir: %s
+git_timeout: 20s
+releases: {enabled: false}
+forges: [{host: git.invalid, type: github, api_url: %q}]
+`, filepath.Join(tmp, "repos"), api.URL)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := New(cfg, st, zerolog.Nop())
+	a.Alert = func(context.Context, string) {}
+	a.Notify = func(context.Context, string) {}
+
+	repo, _ := st.AddRepo(ctx, "https://git.invalid/o/r", "git.invalid/o/r", "git.invalid/o/r", "@u:x")
+	st.MarkChecked(ctx, repo.ID, true, nil)
+	// A broken mirror dir: any real git command on it fails.
+	if err := os.MkdirAll(a.mirrorDir(repo), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if res := a.Check(ctx, repo.ID); res.Err == nil {
+		t.Fatal("first check should fail and flag the takedown")
+	}
+	r, _ := st.Repo(ctx, repo.ID)
+	if r.Upstream != store.UpstreamLegal || r.FailCount != 1 {
+		t.Fatalf("after first check: upstream=%q fails=%d", r.Upstream, r.FailCount)
+	}
+	events := len(a.Live.Snapshot(0).Events)
+
+	for range 3 {
+		res := a.Check(ctx, repo.ID)
+		if res.Err != nil || res.StillGone != forge.Legal || !strings.Contains(res.Text(), "still taken down") {
+			t.Fatalf("skipped check: err=%v gone=%q text=%q", res.Err, res.StillGone, res.Text())
+		}
+	}
+	r2, _ := st.Repo(ctx, repo.ID)
+	if r2.FailCount != 1 || r2.Upstream != store.UpstreamLegal || !r2.LastChecked.After(r.LastChecked.Add(-time.Second)) {
+		t.Fatalf("after skipped checks: %+v", r2)
+	}
+	if n := len(a.Live.Snapshot(0).Events); n != events {
+		t.Errorf("skipped checks added %d feed events", n-events)
+	}
+
+	// Back upstream: the fetch is attempted again (and fails on the fake mirror).
+	status.Store(http.StatusOK)
+	if res := a.Check(ctx, repo.ID); res.Err == nil || res.StillGone != "" {
+		t.Fatalf("expected a real fetch attempt: %+v", res)
 	}
 }

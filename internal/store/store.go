@@ -381,6 +381,12 @@ func (s *Store) MarkChecked(ctx context.Context, id int64, changed bool, checkEr
 	return err
 }
 
+// TouchChecked updates last_checked only (a check that neither succeeded nor failed).
+func (s *Store) TouchChecked(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE repos SET last_checked = ? WHERE id = ?`, time.Now().Unix(), id)
+	return err
+}
+
 func (s *Store) AddEvent(ctx context.Context, repoID int64, kind, detail string) error {
 	_, err := s.db.ExecContext(ctx, `INSERT INTO events (repo_id, time, kind, detail) VALUES (?, ?, ?, ?)`,
 		repoID, time.Now().Unix(), kind, detail)

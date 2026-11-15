@@ -108,6 +108,9 @@ type Result struct {
 	Err            error // git error (fatal for this check)
 	Warnings       []string
 	Preserved      int // refs saved under refs/archive because upstream rewrote/deleted them
+	// StillGone is set when the repo was already flagged gone upstream and a probe found it
+	// still missing, so the fetch was skipped (no error, no fail count, quiet feed).
+	StillGone string
 
 	url    gitops.RepoURL
 	urlOK  bool
@@ -120,6 +123,9 @@ func (r Result) Changed() bool { return r.Cloned || !r.Change.Empty() || len(r.N
 func (r Result) Text() string {
 	if r.Err != nil {
 		return fmt.Sprintf("❌ failed: `%s`", oneLine(r.Err.Error()))
+	}
+	if r.StillGone != "" {
+		return fmt.Sprintf("🪦 still %s upstream; fetch skipped, archive preserved", goneWord(r.StillGone))
 	}
 	var parts []string
 	if r.Cloned {
@@ -198,6 +204,14 @@ func (a *Archiver) check(ctx context.Context, id int64) Result {
 	defer cancel()
 
 	mirror := a.mirrorDir(repo)
+	// A repo already known to be gone upstream: probe first and only fetch once it's back,
+	// instead of failing (and filling the feed) every cycle.
+	if repo.Upstream != "" && repo.Cloned && dirExists(mirror) {
+		if st := a.probe(ctx, u); isGone(st.State) {
+			res.StillGone = st.State
+			return a.finishGone(ctx, res, st, log)
+		}
+	}
 	if _, statErr := os.Stat(mirror); errors.Is(statErr, os.ErrNotExist) {
 		log.Info().Msg("Cloning repository")
 		slot.SetStep("Cloning", "")
@@ -268,7 +282,7 @@ func (a *Archiver) finish(ctx context.Context, res Result, log zerolog.Logger) R
 		a.Live.Event(repo.ID, repo.URL, "error", "Check failed: "+oneLine(res.Err.Error()))
 		alerted := repo.Upstream != ""
 		// Only archived repos can "disappear"; a never-cloned one is just a bad URL.
-		if st := a.probeUpstream(ctx, res); repo.Cloned && st.State == forge.Gone || st.State == forge.Legal || st.State == forge.Blocked {
+		if st := a.probeUpstream(ctx, res); repo.Cloned && isGone(st.State) {
 			_ = a.store.SetUpstream(ctx, repo.ID, st.State, st.Detail)
 			if repo.Upstream != st.State {
 				log.Warn().Str("state", st.State).Str("detail", st.Detail).Msg("Repository disappeared upstream")
@@ -342,17 +356,52 @@ func (a *Archiver) probeUpstream(ctx context.Context, res Result) forge.RepoStat
 	if !res.urlOK || !res.Repo.Cloned || ctx.Err() != nil {
 		return forge.RepoStatus{State: forge.Unknown}
 	}
-	u := res.url
-	pctx, cancel := context.WithTimeout(ctx, time.Minute)
-	defer cancel()
-	live.From(ctx).SetStep("Checking upstream", "")
-	st := a.forge.Probe(pctx, a.provider(pctx, u.Host), u.Owner, u.Name, "https://"+u.Host+"/"+u.Path)
+	st := a.probe(ctx, res.url)
 	if st.State == forge.Unknown {
 		if g := forge.ClassifyGitError(res.Err.Error()); g.State != forge.Unknown {
 			return g
 		}
 	}
 	return st
+}
+
+// probe asks the forge (or the repo's web page) whether the repository exists.
+func (a *Archiver) probe(ctx context.Context, u gitops.RepoURL) forge.RepoStatus {
+	pctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	live.From(ctx).SetStep("Checking upstream", "")
+	return a.forge.Probe(pctx, a.provider(pctx, u.Host), u.Owner, u.Name, "https://"+u.Host+"/"+u.Path)
+}
+
+func isGone(state string) bool {
+	return state == forge.Gone || state == forge.Legal || state == forge.Blocked
+}
+
+func goneWord(state string) string {
+	switch state {
+	case forge.Legal:
+		return "taken down"
+	case forge.Blocked:
+		return "blocked"
+	}
+	return "gone"
+}
+
+// finishGone records a skipped check of a repo that is still missing upstream. The fail
+// count and last error stay as they were; only a change of reason (e.g. gone → DMCA) is logged.
+func (a *Archiver) finishGone(ctx context.Context, res Result, st forge.RepoStatus, log zerolog.Logger) Result {
+	repo := res.Repo
+	_ = a.store.TouchChecked(ctx, repo.ID)
+	if st.State != repo.Upstream {
+		_ = a.store.SetUpstream(ctx, repo.ID, st.State, st.Detail)
+		_ = a.store.AddEvent(ctx, repo.ID, store.EventGone, st.State+": "+st.Detail)
+		a.Live.Event(repo.ID, repo.URL, "gone", "Still missing upstream, now "+st.State+": "+st.Detail)
+	}
+	log.Debug().Str("state", st.State).Msg("Still gone upstream; fetch skipped")
+	if r, err := a.store.Repo(ctx, repo.ID); err == nil {
+		res.Repo = r
+	}
+	return res
 }
 
 // GoneAlertText is the @room alert sent when a repository disappears upstream.

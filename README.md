@@ -81,7 +81,7 @@ To restore a repository from the archive, run `git clone /data/repos/github.com/
 | 451, or a DMCA block | ⚖️ taken down upstream, with the notice link when GitHub provides one |
 | 403 "Repository access blocked" | 🚫 blocked upstream |
 
-The alert is an **@room** message sent right away, not after `failure_alert_threshold` failures. It shows the archive's size, release count and a Browse link. The bot keeps checking. If the repository comes back, it posts ♻️ and resumes updating. Repositories that are gone stay listed in the daily summary under "Gone upstream, preserved here". Network errors, rate limits and server errors are treated as ordinary failures, not takedowns.
+The alert is an **@room** message sent right away, not after `failure_alert_threshold` failures. It shows the archive's size, release count and a Browse link. After that, each check only asks the forge whether the repository is back. It skips the git fetch, so a gone repo stops showing a failure every cycle. If the probe can't tell (network error, or a host without a web page), the bot fetches as usual. If the repository comes back, it posts ♻️ and resumes updating. Repositories that are gone stay listed in the daily summary under "Gone upstream, preserved here". Network errors, rate limits and server errors are treated as ordinary failures, not takedowns.
 
 **Rewritten history.** Before each fetch is applied, the bot compares the refs. When upstream force-pushes a branch, moves a tag, or deletes a branch or tag (deleting only matters with `prune_deleted: true`), the old tip is saved as:
 
