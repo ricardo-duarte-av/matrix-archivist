@@ -57,6 +57,22 @@ var (
 	safeHost    = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$`)
 )
 
+// githubPages maps a GitHub Pages site URL to the repository that serves it:
+// user.github.io/project/... → github.com/user/project, and the bare user site
+// user.github.io (or a top-level page such as /index.html) → github.com/user/user.github.io.
+// Pages sites on custom domains can't be recognized from the URL alone.
+func githubPages(host, p string) (string, string, bool) {
+	user, ok := strings.CutSuffix(host, ".github.io")
+	if !ok || user == "" || strings.Contains(user, ".") {
+		return "", "", false
+	}
+	first, _, _ := strings.Cut(strings.Trim(p, "/"), "/")
+	if first == "" || strings.Contains(first, ".") && !strings.HasSuffix(first, ".github.io") {
+		first = host // user site; "page.html"-style first segments are files, not projects
+	}
+	return "github.com", user + "/" + first, true
+}
+
 // ParseRepoURL validates a user-supplied git URL. Only network transports are allowed
 // (https, http, ssh, git, and scp-style user@host:path); local paths and file:// are rejected.
 func ParseRepoURL(raw string) (RepoURL, error) {
@@ -106,6 +122,13 @@ func ParseRepoURL(raw string) (RepoURL, error) {
 	}
 	if err := checkIPHost(host); err != nil {
 		return RepoURL{}, err
+	}
+
+	if isHTTPS {
+		if h, rp, ok := githubPages(host, p); ok {
+			host, p = h, rp
+			raw = "https://" + h + "/" + rp
+		}
 	}
 
 	p = strings.Trim(p, "/")

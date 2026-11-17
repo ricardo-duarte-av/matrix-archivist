@@ -21,6 +21,11 @@ func TestParseRepoURL(t *testing.T) {
 		{"<https://codeberg.org/forgejo/forgejo>", "codeberg.org/forgejo/forgejo", "forgejo", "forgejo"},
 		{"https://140.82.121.3/o/r", "140.82.121.3/o/r", "o", "r"}, // public IP
 		{"https://git.192.168.example.org/o/r", "git.192.168.example.org/o/r", "o", "r"},
+		// GitHub Pages sites rewrite to the repository behind them.
+		{"https://devall96.github.io/TempleFrog/", "github.com/devall96/templefrog", "devall96", "TempleFrog"},
+		{"https://user.github.io/proj/docs/index.html", "github.com/user/proj", "user", "proj"},
+		{"https://user.github.io", "github.com/user/user.github.io", "user", "user.github.io"},
+		{"https://user.github.io/index.html", "github.com/user/user.github.io", "user", "user.github.io"},
 	}
 	for _, c := range ok {
 		u, err := ParseRepoURL(c.in)
