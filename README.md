@@ -8,6 +8,7 @@ and posts a daily summary of what changed.
 - **Releases:** archives release notes, raw metadata and downloadable assets from **GitHub**, **Gitea / Forgejo / Codeberg** and **GitLab**, including self-hosted instances, which are detected automatically.
 - **End-to-end encryption:** works in encrypted rooms, with pure-Go crypto (no libolm or CGO).
 - **Permissions:** commands that change things require a minimum room power level.
+- **Light mode and sources:** archive hundreds of repositories listed by another service (or added with `add --light`) cheaply: full git history and every release's notes, but files of the newest release only and no checkout.
 - **Takedown-aware:** when a repository disappears upstream (deleted, made private, DMCA'd, blocked), the room gets an @room alert saying so, and the archive is kept.
 - **History is never lost:** force-pushes, moved tags and deleted refs upstream are snapshotted under `refs/archive/` before they're overwritten.
 - **Web file browser:** a read-only listing of the archive, also usable as a room widget. Download single files (resumable), or any folder as a zip.
@@ -20,7 +21,7 @@ The base command is set by `command_prefix` (default `!archivist`).
 
 | Command | Who | |
 |---|---|---|
-| `!archivist add <url> [url…]` | PL ≥ `min_power_level` | Add repositories. Each is cloned straight away and the bot replies when done. |
+| `!archivist add [--light] <url> [url…]` | PL ≥ `min_power_level` | Add repositories. Each is cloned straight away and the bot replies when done. `--light` adds them in [light mode](#light-mode-and-sources). |
 | `!archivist remove <#id\|url> [--purge]` | PL ≥ `min_power_level` | Stop tracking. Files stay on disk unless `--purge` is given. |
 | `!archivist list [tag]` | everyone | Tracked repositories with their `#id`, state and tags; optionally only those with a tag. |
 | `!archivist search <text\|#tag>…` | everyone | Find repositories by URL, description, README, note, topic or tag. All terms must match; the best 50 are shown, name and description matches first. |
@@ -28,6 +29,7 @@ The base command is set by `command_prefix` (default `!archivist`).
 | `!archivist note <#id> [text\|--clear]` | PL ≥ `min_power_level` | Show, set or clear a note ("why we archived this"). |
 | `!archivist tag <#id> <tag>…` / `untag …` | PL ≥ `min_power_level` | Add or remove tags. |
 | `!archivist refresh <#id\|url\|all>` | PL ≥ `min_power_level` | Check now and reply with what changed. |
+| `!archivist light <#id\|url>…` / `full …` | PL ≥ `min_power_level` | Switch repositories to [light or full mode](#light-mode-and-sources) and check them right away. |
 | `!archivist status` | everyone | Overall status: counts, storage, next summary. `status #id` is the same as `info`. |
 | `!archivist usage` | everyone | Disk usage per repository, biggest first, and free space. |
 | `!archivist summary` | everyone | Post the summary of changes since the last scheduled summary. |
@@ -53,6 +55,50 @@ Repository URLs say little ("TheItalianJob" may be a Mario port), so the bot col
 
 Accepted URLs are `https://`, `http://`, `ssh://`, `git://` and `git@host:owner/repo`.
 Local paths and `file://` are rejected.
+
+## Light mode and sources
+
+Archiving everything in full gets big, mostly because of release files and the checkout. Light mode keeps what can't be recovered later, for much less space:
+
+| | Full | Light 🪶 |
+|---|---|---|
+| Git history (`mirror.git`, all branches and tags, `refs/archive/` snapshots) | ✅ | ✅ |
+| Browsable checkout | ✅ | ❌ (`git clone mirror.git` gives one) |
+| Release notes and `release.json` | within `releases.*` limits | every release |
+| Release files | within `releases.*` limits | newest release only (`light.releases`) |
+| Checked every | `check_interval` | `light.check_interval` (12h) |
+| @room alert when it disappears upstream | ✅ | ✅ |
+| @room alert after repeated failures, notice on force-push | ✅ | ❌ (daily summary only) |
+
+The description, README search and takedown detection work the same; the README is read straight from the mirror.
+In the daily summary, light repositories are counted ("Light archives updated (37): 3 new releases") and only listed when there are ten or fewer.
+`list` and `search` mark them with 🪶 and `info` shows the mode.
+
+`!archivist light #12` switches a repository to light mode: its checkout and the files of older releases are removed, and their notes stay. `!archivist full #12` switches it back and downloads what full mode keeps.
+
+### Sources
+
+A source is a list of repositories that the bot fetches every `interval` and archives automatically, in light mode by default. Configure it under `sources:` in `config.yaml`. For example, the list of a [recomps-ai-bot](https://github.com/ricardo-duarte-av/recomps-ai-bot):
+
+```yaml
+sources:
+  - name: recomps
+    url: http://recompbot:8080/api/recomps   # same Docker network; or the bot's public URL
+    tags: [recomps]
+    tag_fields: [kind, system]               # tags such as recomp, n64
+    note_fields: [game, system]              # note: "Super Mario 64 · N64"
+    announce: >-
+      Adding {{.repo}}, {{if eq .kind "toolkit"}}a toolkit for {{.system}}{{else}}a
+      {{if eq .kind "reimpl"}}reimplementation{{else}}{{.kind}}{{end}} of **{{.game}}**
+      from {{.system}}{{with .oses}}, for {{list .}}{{end}}{{end}}
+```
+
+- **New entries** are added right away and cloned by the next check cycles, at most `light.max_clones_per_cycle` (50) per cycle, so a list of 600 repositories is archived over a few hours without holding up the others. The first sync adds everything already on the list.
+- **Announcements:** each added repository gets a notice in the room, written by the `announce` template (the example gives "📥 Adding https://github.com/o/r, a recomp of **Super Mario 64** from N64, for Windows, Linux and macOS (**#601**, light archive)"). The template sees the entry's JSON fields plus `.repo`, `.id` and `.mode`, and `list` joins a list as "A, B and C". Without a template the notice is "Archiving #601 https://github.com/o/r". When one sync adds more than 10 repositories, as the first sync of an existing list does, they are announced in one grouped notice instead.
+- **Removed entries** are never deleted from the archive. They get the tag `delisted` (and lose it if they come back). If a source suddenly lists less than half of what it added, nothing is marked delisted, in case it is broken.
+- **Removing by hand:** `remove` on a repository a source added stops the source from adding it back. `add` it again to undo that.
+- **Links** to files inside a GitHub repository (`github.com/o/r/tree/…`, `raw.githubusercontent.com/o/r/…`) are reduced to the repository.
+- **Format:** a JSON array of objects (`url_field`, `tag_fields`, `note_fields` choose the fields) or of URL strings, or plain text with one URL per line.
 
 ## Storage layout
 
@@ -192,6 +238,8 @@ See [`config.example.yaml`](config.example.yaml); every option is commented ther
 | `summary.time` / `summary.timezone` | When the daily summary is posted. |
 | `allow_internal_hosts` | Let forge API calls and release downloads reach internal addresses (default `false`). |
 | `releases.*` | Release archiving, asset downloads, per-asset size cap, prereleases, retention (`keep_last`, `max_repo_size`). |
+| `light.*` | Check interval, clones per cycle and release limits of [light repositories](#light-mode-and-sources). |
+| `sources` | Lists of repositories to archive automatically. |
 | `forges` | API tokens and self-hosted forges. A GitHub token is strongly recommended: without one the API allows 60 requests/hour. |
 | `prune_deleted` | Whether branches and tags deleted upstream are deleted from the archive too. Default `false`: they are kept. Either way they're snapshotted under `refs/archive/` first. |
 | `disk_warn_free` | @room alert when free space in `storage_dir` drops below this (default `5GB`). A notice follows when it recovers. |
@@ -205,7 +253,7 @@ For @room to notify anyone, the bot needs the room's "Notify everyone" power lev
 
 ## Notes
 
-- **Release retention.** By default every release is kept. `releases.keep_last: 10` keeps only the newest 10. `releases.max_repo_size: 2GB` removes the oldest releases while a repository (git data plus releases) is bigger than that, but always keeps the newest one. Releases outside these limits are never downloaded. Archived ones are deleted when a new release pushes them out, or when you tighten the limits. Raising the limits downloads them again. A release deleted upstream counts like any other, so it stays archived while it is among the newest. Git history is never removed.
+- **Release retention.** By default every release is kept. `releases.keep_last: 10` keeps only the newest 10. `releases.max_repo_size: 2GB` removes the oldest releases while a repository (git data plus releases) is bigger than that, but always keeps the newest one. Releases outside these limits are never downloaded. Archived ones are deleted when a new release pushes them out, or when you tighten the limits. Raising the limits downloads them again. A release deleted upstream counts like any other, so it stays archived while it is among the newest. Git history is never removed. These limits apply to full repositories; light ones use `light.releases` and only ever lose a release's files, never its notes. Releases reduced to notes this way are kept in full mode too.
 - **First sync can take a while** for projects with many releases and large assets. While it runs, `list` shows progress (`🔄 archiving releases (3/10: v1.2)`). Use the retention limits above, `releases.max_asset_size`, or `download_assets: false` to limit this.
 - **The bot's device is unverified,** so Element may show a shield warning on its messages. That is harmless.
 - **Git LFS objects are not archived**; only the LFS pointer files are.

@@ -26,9 +26,13 @@ func idCell(r *store.Repo) cell {
 	return cell{"<strong>" + s + "</strong>", s}
 }
 
-// repoCell links the repository and shows its tags.
+// repoCell links the repository and shows its tags; light archives are marked with 🪶.
 func repoCell(r *store.Repo) cell {
 	c := linkCell(r.URL, displayURL(r.URL))
+	if r.Mode == store.ModeLight {
+		c.html += " 🪶"
+		c.text += " 🪶"
+	}
 	for _, t := range r.Tags {
 		c.html += " <code>" + html.EscapeString(t) + "</code>"
 		c.text += " `" + t + "`"

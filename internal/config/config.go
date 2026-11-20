@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"text/template"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -53,6 +54,84 @@ type Releases struct {
 
 // Limited reports whether any release retention limit is set.
 func (r Releases) Limited() bool { return r.KeepLast > 0 || r.MaxRepoSize > 0 }
+
+// Light configures "light" archiving, meant for large sets of repositories added
+// automatically (see Sources): a bare mirror with full history but no checkout, release
+// notes for every release but files only for the newest ones, checked less often.
+type Light struct {
+	CheckIntervalRaw string `yaml:"check_interval"`
+	// MaxClonesPerCycle caps how many light repositories are cloned for the first time in one
+	// check cycle (0 = no cap), so a big import doesn't hold up the other repositories.
+	MaxClonesPerCycle int           `yaml:"max_clones_per_cycle"`
+	Releases          LightReleases `yaml:"releases"`
+
+	CheckInterval time.Duration `yaml:"-"`
+}
+
+// LightReleases are the release limits of light repositories. Notes and metadata of every
+// release are always kept; these limits only decide which releases get their files.
+type LightReleases struct {
+	DownloadAssets  bool   `yaml:"download_assets"`
+	MaxAssetSizeRaw string `yaml:"max_asset_size"`
+	KeepLast        int    `yaml:"keep_last"`
+	MaxRepoSizeRaw  string `yaml:"max_repo_size"`
+
+	MaxAssetSize int64 `yaml:"-"`
+	MaxRepoSize  int64 `yaml:"-"`
+}
+
+// Source is a list of repositories, fetched periodically over HTTP, whose entries are added to
+// the archive automatically: a JSON array of objects (or of URL strings), or plain text with
+// one URL per line.
+type Source struct {
+	Name        string `yaml:"name"`
+	URL         string `yaml:"url"`
+	IntervalRaw string `yaml:"interval"`
+	// Mode of the repositories added from this source: light (default) or full.
+	Mode string   `yaml:"mode"`
+	Tags []string `yaml:"tags"`
+	// URLField is the JSON field holding the repository URL (default "url").
+	URLField string `yaml:"url_field"`
+	// TagFields are JSON fields whose values (strings or lists of strings) become tags.
+	TagFields []string `yaml:"tag_fields"`
+	// NoteFields are JSON fields joined into the repository's note ("Game · System").
+	NoteFields []string `yaml:"note_fields"`
+	// Announce is a Go text/template for the room notice sent for each repository added. It
+	// sees the entry's JSON fields plus .repo (the repository URL), .id and .mode, and has
+	// a "list" function ("A, B and C"). Empty: a plain "Archiving <url>" notice.
+	Announce string `yaml:"announce"`
+
+	Interval         time.Duration      `yaml:"-"`
+	AnnounceTemplate *template.Template `yaml:"-"`
+}
+
+// TemplateFuncs are the functions available in Source.Announce.
+var TemplateFuncs = template.FuncMap{
+	"list": func(v any) string {
+		var items []string
+		switch t := v.(type) {
+		case []any:
+			for _, x := range t {
+				if s := strings.TrimSpace(fmt.Sprint(x)); s != "" && x != nil {
+					items = append(items, s)
+				}
+			}
+		case nil:
+		default:
+			items = append(items, fmt.Sprint(t))
+		}
+		if len(items) <= 1 {
+			return strings.Join(items, "")
+		}
+		return strings.Join(items[:len(items)-1], ", ") + " and " + items[len(items)-1]
+	},
+}
+
+// Repository archive modes.
+const (
+	ModeFull  = "full"
+	ModeLight = "light"
+)
 
 type Forge struct {
 	Host  string `yaml:"host"`
@@ -132,6 +211,8 @@ type Config struct {
 	Releases           Releases `yaml:"releases"`
 	Forges             []Forge  `yaml:"forges"`
 	HTTP               HTTP     `yaml:"http"`
+	Light              Light    `yaml:"light"`
+	Sources            []Source `yaml:"sources"`
 
 	CheckInterval time.Duration `yaml:"-"`
 	GitTimeout    time.Duration `yaml:"-"`
@@ -171,6 +252,15 @@ func defaults() *Config {
 			DownloadAssets:     true,
 			MaxAssetSizeRaw:    "2GB",
 			IncludePrereleases: true,
+		},
+		Light: Light{
+			CheckIntervalRaw:  "12h",
+			MaxClonesPerCycle: 50,
+			Releases: LightReleases{
+				DownloadAssets:  true,
+				MaxAssetSizeRaw: "200MB",
+				KeepLast:        1,
+			},
 		},
 	}
 }
@@ -280,6 +370,58 @@ func (c *Config) validate() error {
 	}
 	if c.Releases.KeepLast < 0 {
 		add("releases.keep_last must be 0 (all) or more")
+	}
+
+	if c.Light.CheckInterval, err = time.ParseDuration(c.Light.CheckIntervalRaw); err != nil || c.Light.CheckInterval < time.Minute {
+		add("light.check_interval must be a duration >= 1m (e.g. 12h)")
+	}
+	if c.Light.MaxClonesPerCycle < 0 {
+		add("light.max_clones_per_cycle must be 0 (no cap) or more")
+	}
+	if c.Light.Releases.MaxAssetSize, err = ParseSize(c.Light.Releases.MaxAssetSizeRaw); err != nil {
+		add("light.releases.max_asset_size: %v", err)
+	}
+	if c.Light.Releases.MaxRepoSize, err = ParseSize(c.Light.Releases.MaxRepoSizeRaw); err != nil {
+		add("light.releases.max_repo_size: %v", err)
+	}
+	if c.Light.Releases.KeepLast < 0 {
+		add("light.releases.keep_last must be 0 (all) or more")
+	}
+
+	names := map[string]bool{}
+	for i := range c.Sources {
+		s := &c.Sources[i]
+		s.Name = strings.TrimSpace(s.Name)
+		if s.Name == "" || strings.ContainsAny(s.Name, " \t\n,`*_") {
+			add("sources[%d].name is required and must be a single word", i)
+		} else if names[s.Name] {
+			add("sources[%d].name %q is used twice", i, s.Name)
+		}
+		names[s.Name] = true
+		if u, err := url.Parse(s.URL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			add("sources[%d].url must be an http:// or https:// URL", i)
+		}
+		if s.IntervalRaw == "" {
+			s.IntervalRaw = "15m"
+		}
+		if s.Interval, err = time.ParseDuration(s.IntervalRaw); err != nil || s.Interval < time.Minute {
+			add("sources[%d].interval must be a duration >= 1m (e.g. 15m)", i)
+		}
+		s.Mode = strings.ToLower(strings.TrimSpace(s.Mode))
+		if s.Mode == "" {
+			s.Mode = ModeLight
+		}
+		if s.Mode != ModeLight && s.Mode != ModeFull {
+			add("sources[%d].mode must be light or full", i)
+		}
+		if s.URLField == "" {
+			s.URLField = "url"
+		}
+		if strings.TrimSpace(s.Announce) != "" {
+			if s.AnnounceTemplate, err = template.New(s.Name).Funcs(TemplateFuncs).Parse(strings.TrimSpace(s.Announce)); err != nil {
+				add("sources[%d].announce: %v", i, err)
+			}
+		}
 	}
 
 	if c.HTTP.Enabled {

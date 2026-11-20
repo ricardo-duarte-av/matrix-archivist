@@ -19,13 +19,24 @@ const forgeInfoMaxAge = 24 * time.Hour
 // otherwise ignored.
 func (a *Archiver) updateMeta(ctx context.Context, res Result, askForge bool, log zerolog.Logger) {
 	repo := res.Repo
-	if (res.Changed() || repo.ReadmeAt.IsZero()) && dirExists(a.checkoutDir(repo)) {
-		live.From(ctx).SetStep("Reading README", "")
-		info, _ := readme.Read(a.checkoutDir(repo))
-		if err := a.store.SetReadme(ctx, repo.ID, store.Readme{
-			Title: info.Title, Summary: info.Summary, Links: info.Links, Text: info.Text,
-		}); err != nil {
-			log.Err(err).Msg("Failed to save README metadata")
+	if res.Changed() || repo.ReadmeAt.IsZero() {
+		var info readme.Info
+		ok := false
+		if dirExists(a.checkoutDir(repo)) {
+			live.From(ctx).SetStep("Reading README", "")
+			info, _ = readme.Read(a.checkoutDir(repo))
+			ok = true
+		} else if dirExists(a.mirrorDir(repo)) {
+			// Light archives have no checkout: read the README from the mirror's HEAD.
+			live.From(ctx).SetStep("Reading README", "")
+			info, ok = a.mirrorReadme(ctx, repo)
+		}
+		if ok {
+			if err := a.store.SetReadme(ctx, repo.ID, store.Readme{
+				Title: info.Title, Summary: info.Summary, Links: info.Links, Text: info.Text,
+			}); err != nil {
+				log.Err(err).Msg("Failed to save README metadata")
+			}
 		}
 	}
 	if !askForge || !res.urlOK || time.Since(repo.ForgeInfoAt) < forgeInfoMaxAge || ctx.Err() != nil {
@@ -44,4 +55,29 @@ func (a *Archiver) updateMeta(ctx context.Context, res Result, askForge bool, lo
 		log.Debug().Err(err).Msg("Failed to fetch repository description")
 	}
 	_ = a.store.SetForgeInfo(ctx, repo.ID, info.Description, info.Homepage, info.Topics, err == nil)
+}
+
+// mirrorReadme extracts the README at the top of the mirror's default branch. ok is false
+// if the mirror can't be read (an empty repository without a README is ok).
+func (a *Archiver) mirrorReadme(ctx context.Context, repo *store.Repo) (readme.Info, bool) {
+	rctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	mirror := a.mirrorDir(repo)
+	files, err := a.git.RootFiles(rctx, mirror)
+	if err != nil {
+		return readme.Info{}, false // e.g. an empty repository; tried again after a change
+	}
+	names := make([]string, 0, len(files))
+	for n := range files {
+		names = append(names, n)
+	}
+	name := readme.Pick(names)
+	if name == "" {
+		return readme.Info{}, true
+	}
+	data, err := a.git.ReadBlob(rctx, mirror, files[name], readme.MaxText)
+	if err != nil {
+		return readme.Info{}, false
+	}
+	return readme.Extract(string(data)), true
 }

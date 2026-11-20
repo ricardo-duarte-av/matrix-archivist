@@ -24,19 +24,11 @@ type Info struct {
 
 var extRank = map[string]int{"md": 0, "markdown": 1, "": 2, "txt": 3, "rst": 4, "org": 5, "adoc": 6}
 
-// Find returns the path of the README in dir ("" if none). Markdown is preferred.
-func Find(dir string) string {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return ""
-	}
+// Pick returns the README among file names ("" if none). Markdown is preferred.
+func Pick(names []string) string {
 	best, bestRank := "", 99
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		name := strings.ToLower(e.Name())
-		base, ext, _ := strings.Cut(name, ".")
+	for _, n := range names {
+		base, ext, _ := strings.Cut(strings.ToLower(n), ".")
 		if base != "readme" {
 			continue
 		}
@@ -44,11 +36,28 @@ func Find(dir string) string {
 		if !known {
 			rank = 10
 		}
-		if rank < bestRank {
-			best, bestRank = filepath.Join(dir, e.Name()), rank
+		if rank < bestRank || (rank == bestRank && n < best) {
+			best, bestRank = n, rank
 		}
 	}
+	return best
+}
+
+// Find returns the path of the README in dir ("" if none). Markdown is preferred.
+func Find(dir string) string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	var names []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			names = append(names, e.Name())
+		}
+	}
+	best := Pick(names)
 	if best != "" {
+		best = filepath.Join(dir, best)
 		// Don't follow a symlink out of the checkout.
 		if fi, err := os.Lstat(best); err != nil || !fi.Mode().IsRegular() {
 			return ""

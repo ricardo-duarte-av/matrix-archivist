@@ -25,11 +25,11 @@ type command struct {
 
 var commands map[string]command
 
-var helpOrder = []string{"add", "remove", "list", "search", "info", "note", "tag", "untag", "refresh", "status", "usage", "summary", "export", "import", "help"}
+var helpOrder = []string{"add", "remove", "list", "search", "info", "note", "tag", "untag", "refresh", "light", "full", "status", "usage", "summary", "export", "import", "help"}
 
 func init() {
 	commands = map[string]command{
-		"add":     {"add <url> [url…]", "Add git repositories to the archive", true, (*Bot).cmdAdd},
+		"add":     {"add [--light] <url> [url…]", "Add git repositories to the archive (`--light`: history and newest release only)", true, (*Bot).cmdAdd},
 		"remove":  {"remove <#id|url> [--purge]", "Stop tracking a repository (`--purge` also deletes its files)", true, (*Bot).cmdRemove},
 		"list":    {"list [tag]", "List tracked repositories, optionally only those with a tag", false, (*Bot).cmdList},
 		"search":  {"search <text|#tag>…", "Search repositories by URL, description, README, notes and tags (best 50 shown)", false, (*Bot).cmdSearch},
@@ -38,6 +38,8 @@ func init() {
 		"tag":     {"tag <#id> <tag>…", "Add tags to a repository", true, (*Bot).cmdTag},
 		"untag":   {"untag <#id> <tag>…", "Remove tags from a repository", true, (*Bot).cmdUntag},
 		"refresh": {"refresh <#id|url|all>", "Check a repository for updates now", true, (*Bot).cmdRefresh},
+		"light":   {"light <#id|url>…", "Switch to light archiving: git history and release notes, files of the newest release only, no checkout", true, (*Bot).cmdLight},
+		"full":    {"full <#id|url>…", "Switch to full archiving: checkout and every release within the normal limits", true, (*Bot).cmdFull},
 		"status":  {"status [#id|url]", "Overall status (or details about one repository)", false, (*Bot).cmdStatus},
 		"usage":   {"usage", "Disk usage per repository and free space", false, (*Bot).cmdUsage},
 		"summary": {"summary", "Post the summary of changes since the last scheduled summary", false, (*Bot).cmdSummary},
@@ -83,7 +85,7 @@ func (b *Bot) cmdHelp(evt *event.Event, _ []string) {
 		}
 		fmt.Fprintf(&sb, "- `%s %s` — %s%s\n", b.cfg.CommandPrefix, c.usage, c.desc, lock)
 	}
-	fmt.Fprintf(&sb, "\nRepositories are checked every %s.", b.cfg.CheckInterval)
+	fmt.Fprintf(&sb, "\nRepositories are checked every %s, light ones (🪶) every %s.", b.cfg.CheckInterval, b.cfg.Light.CheckInterval)
 	if b.cfg.Summary.Enabled {
 		fmt.Fprintf(&sb, " A summary is posted daily at %s (%s).", b.cfg.Summary.Time, b.cfg.Summary.Timezone)
 	}
@@ -95,24 +97,34 @@ func (b *Bot) cmdAdd(evt *event.Event, args []string) {
 		b.reply(evt, fmt.Sprintf("Usage: `%s add <url>`", b.cfg.CommandPrefix))
 		return
 	}
+	mode := store.ModeFull
 	var lines []string
 	var added []*store.Repo
 	for _, raw := range args {
+		if raw == "--light" || raw == "-l" {
+			mode = store.ModeLight
+			continue
+		}
 		u, err := gitops.ParseRepoURL(raw)
 		if err != nil {
 			lines = append(lines, fmt.Sprintf("- ❌ `%s`: %v", raw, err))
 			continue
 		}
-		repo, err := b.store.AddRepo(b.ctx, u.Raw, u.Key(), u.RelDir(), evt.Sender.String())
+		_ = b.store.Unignore(b.ctx, u.Key())
+		repo, err := b.store.AddRepoMode(b.ctx, u.Raw, u.Key(), u.RelDir(), evt.Sender.String(), mode, "")
 		switch {
 		case errors.Is(err, store.ErrDuplicate):
-			lines = append(lines, fmt.Sprintf("- ℹ️ already tracked as **#%d** %s", repo.ID, repo.URL))
+			lines = append(lines, fmt.Sprintf("- ℹ️ already tracked as **#%d** %s (%s mode; `%s %s #%d` to switch)", repo.ID, repo.URL, repo.Mode, b.cfg.CommandPrefix, otherMode(repo.Mode), repo.ID))
 		case err != nil:
 			lines = append(lines, fmt.Sprintf("- ❌ `%s`: %v", raw, err))
 		default:
 			lines = append(lines, fmt.Sprintf("- ✅ added **#%d** %s — cloning…", repo.ID, repo.URL))
 			added = append(added, repo)
 		}
+	}
+	if len(lines) == 0 {
+		b.reply(evt, fmt.Sprintf("Usage: `%s add [--light] <url>`", b.cfg.CommandPrefix))
+		return
 	}
 	b.reply(evt, strings.Join(lines, "\n"))
 	if len(added) == 0 {
@@ -180,6 +192,10 @@ func (b *Bot) cmdRemove(evt *event.Event, args []string) {
 		if err := b.arch.Remove(b.ctx, repo, purge); err != nil {
 			lines = append(lines, fmt.Sprintf("- ❌ #%d: %v", repo.ID, err))
 			continue
+		}
+		// Keep the source that added it from adding it again; `add` undoes this.
+		if repo.Source != "" {
+			_ = b.store.Ignore(b.ctx, repo.Key, repo.Source)
 		}
 		if purge {
 			lines = append(lines, fmt.Sprintf("- 🗑️ removed **#%d** %s and deleted its files", repo.ID, repo.URL))
@@ -263,7 +279,7 @@ func (b *Bot) cmdRefresh(evt *event.Event, args []string) {
 	}
 	if strings.EqualFold(args[0], "all") {
 		done := b.progress(evt)
-		results, ran := b.arch.RunCycle(b.ctx)
+		results, ran := b.arch.RunCycle(b.ctx, true)
 		if !ran {
 			done(true)
 			b.reply(evt, "A check cycle is already running; results will appear in the next summary.")
@@ -334,9 +350,12 @@ func (b *Bot) cmdStatus(evt *event.Event, args []string) {
 		b.reply(evt, "❌ "+err.Error())
 		return
 	}
-	failing, gone := 0, 0
+	failing, gone, light := 0, 0, 0
 	var used int64
 	for _, r := range repos {
+		if r.Mode == store.ModeLight {
+			light++
+		}
 		if r.Upstream != "" {
 			gone++
 		} else if r.FailCount > 0 {
@@ -348,6 +367,13 @@ func (b *Bot) cmdStatus(evt *event.Event, args []string) {
 		{textCell("Repositories"), textCell(fmt.Sprintf("%d (%d failing, %d gone upstream)", len(repos), failing, gone))},
 		{textCell("Storage used"), textCell(gitops.HumanSize(used) + freeSpaceText(b.cfg.StorageDir))},
 		{textCell("Check interval"), textCell(b.cfg.CheckInterval.String())},
+	}
+	if light > 0 {
+		rows[0] = []cell{textCell("Repositories"), textCell(fmt.Sprintf("%d: %d full, %d light (%d failing, %d gone upstream)", len(repos), len(repos)-light, light, failing, gone))}
+		rows = append(rows, []cell{textCell("Light check interval"), textCell(b.cfg.Light.CheckInterval.String())})
+	}
+	for _, src := range b.cfg.Sources {
+		rows = append(rows, []cell{textCell("Source " + src.Name), textCell(fmt.Sprintf("%s, every %s, %s mode", src.URL, src.Interval, src.Mode))})
 	}
 	if u := b.cfg.HTTP.BrowseURL(""); u != "" {
 		rows = append(rows, []cell{textCell("Browse"), linkCell(u, u)})
@@ -363,4 +389,65 @@ func (b *Bot) cmdStatus(evt *event.Event, args []string) {
 
 func (b *Bot) cmdSummary(_ *event.Event, _ []string) {
 	b.arch.PostSummary(b.ctx, false)
+}
+
+func otherMode(mode string) string {
+	if mode == store.ModeLight {
+		return store.ModeFull
+	}
+	return store.ModeLight
+}
+
+func (b *Bot) cmdLight(evt *event.Event, args []string) { b.setMode(evt, args, store.ModeLight) }
+
+func (b *Bot) cmdFull(evt *event.Event, args []string) { b.setMode(evt, args, store.ModeFull) }
+
+// setMode switches repositories to an archive mode and checks them right away, which fetches
+// what full mode adds or removes what light mode drops.
+func (b *Bot) setMode(evt *event.Event, args []string, mode string) {
+	if len(args) == 0 {
+		b.reply(evt, fmt.Sprintf("Usage: `%s %s <#id|url>…`", b.cfg.CommandPrefix, mode))
+		return
+	}
+	var repos []*store.Repo
+	var problems []string
+	for _, a := range args {
+		r, err := b.resolve(a)
+		switch {
+		case err != nil:
+			problems = append(problems, "- ❌ "+err.Error())
+		case r.Mode == mode:
+			problems = append(problems, fmt.Sprintf("- ℹ️ **#%d** is already in %s mode", r.ID, mode))
+		default:
+			if err := b.store.SetMode(b.ctx, r.ID, mode); err != nil {
+				problems = append(problems, fmt.Sprintf("- ❌ #%d: %v", r.ID, err))
+				continue
+			}
+			repos = append(repos, r)
+		}
+	}
+	if len(problems) > 0 {
+		b.reply(evt, strings.Join(problems, "\n"))
+	}
+	if len(repos) == 0 {
+		return
+	}
+	done := b.progress(evt)
+	ok := true
+	var rows [][]cell
+	for _, r := range repos {
+		res := b.arch.Check(b.ctx, r.ID)
+		ok = ok && res.Err == nil
+		rows = append(rows, []cell{idCell(r), linkCell(r.URL, displayURL(r.URL)), mdCell(res.Text())})
+	}
+	done(ok)
+	b.replyRich(evt, TableMessages(fmt.Sprintf("Switched %d %s to **%s** mode.", len(repos), plural(len(repos), "repository", "repositories"), mode),
+		[]string{"#", "Repository", "Result"}, rows, "")...)
+}
+
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }

@@ -442,6 +442,37 @@ func (g *Git) SyncCheckout(ctx context.Context, mirrorDir, checkoutDir string) e
 	return err
 }
 
+// RootFiles lists the regular files at the top of HEAD in a (bare) repository, mapping each
+// name to its blob hash. Symlinks and submodules are left out.
+func (g *Git) RootFiles(ctx context.Context, dir string) (map[string]string, error) {
+	out, err := g.run(ctx, dir, "ls-tree", "-z", "HEAD")
+	if err != nil {
+		return nil, err
+	}
+	files := map[string]string{}
+	for _, entry := range strings.Split(out, "\x00") {
+		meta, name, ok := strings.Cut(entry, "\t")
+		f := strings.Fields(meta)
+		if !ok || len(f) != 3 || f[1] != "blob" || (f[0] != "100644" && f[0] != "100755") {
+			continue
+		}
+		files[name] = f[2]
+	}
+	return files, nil
+}
+
+// ReadBlob returns up to max bytes of a blob.
+func (g *Git) ReadBlob(ctx context.Context, dir, hash string, max int) ([]byte, error) {
+	out, err := g.run(ctx, dir, "cat-file", "blob", hash)
+	if err != nil {
+		return nil, err
+	}
+	if len(out) > max {
+		out = out[:max]
+	}
+	return []byte(out), nil
+}
+
 // DirSize returns the total size in bytes of files under dir.
 func DirSize(dir string) int64 {
 	var total int64

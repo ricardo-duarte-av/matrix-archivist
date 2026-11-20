@@ -31,6 +31,11 @@ type Repo struct {
 	FailCount   int
 	Cloned      bool
 
+	// Mode is ModeFull or ModeLight; Source names the configured source that added the
+	// repository ("" if it was added by hand).
+	Mode   string
+	Source string
+
 	// Upstream is "" while the upstream repo is believed to exist, or one of UpstreamGone,
 	// UpstreamLegal, UpstreamBlocked once a failing check found it missing.
 	Upstream       string
@@ -58,6 +63,15 @@ type Repo struct {
 	Activity      string
 	ActivitySince time.Time
 }
+
+// Archive modes (see config.Light).
+const (
+	ModeFull  = "full"
+	ModeLight = "light"
+)
+
+// TagDelisted marks repositories that their source no longer lists.
+const TagDelisted = "delisted"
 
 const (
 	UpstreamGone    = "gone"    // 404/410: deleted, renamed away or made private
@@ -164,6 +178,14 @@ var migrations = []string{
 	ALTER TABLE repos ADD COLUMN readme_text TEXT NOT NULL DEFAULT '';
 	ALTER TABLE repos ADD COLUMN readme_at INTEGER NOT NULL DEFAULT 0;
 	ALTER TABLE repos ADD COLUMN forge_info_at INTEGER NOT NULL DEFAULT 0;`,
+	`ALTER TABLE repos ADD COLUMN mode TEXT NOT NULL DEFAULT 'full';
+	ALTER TABLE repos ADD COLUMN source TEXT NOT NULL DEFAULT '';
+	ALTER TABLE releases ADD COLUMN meta_only INTEGER NOT NULL DEFAULT 0;
+	CREATE TABLE ignored (
+		key        TEXT PRIMARY KEY,
+		source     TEXT NOT NULL,
+		ignored_at INTEGER NOT NULL
+	);`,
 }
 
 func (s *Store) migrate(ctx context.Context) error {
@@ -215,7 +237,7 @@ func fromUnix(v int64) time.Time {
 
 const repoCols = `id, url, key, rel_dir, added_by, added_at, last_checked, last_changed, last_error, fail_count, cloned,
 	upstream, upstream_detail, upstream_since, notes, tags, size_bytes,
-	description, homepage, topics, readme_title, readme_summary, links, readme_at, forge_info_at`
+	description, homepage, topics, readme_title, readme_summary, links, readme_at, forge_info_at, mode, source`
 
 func scanRepo(row interface{ Scan(...any) error }) (*Repo, error) {
 	var r Repo
@@ -223,7 +245,7 @@ func scanRepo(row interface{ Scan(...any) error }) (*Repo, error) {
 	var tags, topics, links string
 	if err := row.Scan(&r.ID, &r.URL, &r.Key, &r.RelDir, &r.AddedBy, &added, &checked, &changed, &r.LastError, &r.FailCount, &r.Cloned,
 		&r.Upstream, &r.UpstreamDetail, &upSince, &r.Notes, &tags, &r.SizeBytes,
-		&r.Description, &r.Homepage, &topics, &r.ReadmeTitle, &r.ReadmeSummary, &links, &readmeAt, &forgeAt); err != nil {
+		&r.Description, &r.Homepage, &topics, &r.ReadmeTitle, &r.ReadmeSummary, &links, &readmeAt, &forgeAt, &r.Mode, &r.Source); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -293,18 +315,60 @@ func (s *Store) SetTags(ctx context.Context, id int64, tags []string) error {
 	return err
 }
 
+// SetMode switches a repository between ModeFull and ModeLight.
+func (s *Store) SetMode(ctx context.Context, id int64, mode string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE repos SET mode = ? WHERE id = ?`, mode, id)
+	return err
+}
+
+// Ignore records that a repository removed by hand must not be added again by a source.
+func (s *Store) Ignore(ctx context.Context, key, source string) error {
+	_, err := s.db.ExecContext(ctx, `INSERT OR REPLACE INTO ignored (key, source, ignored_at) VALUES (?, ?, ?)`,
+		key, source, time.Now().Unix())
+	return err
+}
+
+// Unignore lets sources add a repository again.
+func (s *Store) Unignore(ctx context.Context, key string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM ignored WHERE key = ?`, key)
+	return err
+}
+
+// Ignored returns the keys of repositories that sources must not add.
+func (s *Store) Ignored(ctx context.Context) (map[string]bool, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT key FROM ignored`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			return nil, err
+		}
+		out[k] = true
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) SetSize(ctx context.Context, id int64, size int64) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE repos SET size_bytes = ? WHERE id = ?`, size, id)
 	return err
 }
 
 func (s *Store) AddRepo(ctx context.Context, url, key, relDir, addedBy string) (*Repo, error) {
+	return s.AddRepoMode(ctx, url, key, relDir, addedBy, ModeFull, "")
+}
+
+// AddRepoMode adds a repository in the given archive mode, recording the source that added it.
+func (s *Store) AddRepoMode(ctx context.Context, url, key, relDir, addedBy, mode, source string) (*Repo, error) {
 	if existing, err := s.RepoByKey(ctx, key); err == nil {
 		return existing, ErrDuplicate
 	}
 	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO repos (url, key, rel_dir, added_by, added_at) VALUES (?, ?, ?, ?, ?)`,
-		url, key, relDir, addedBy, time.Now().Unix())
+		`INSERT INTO repos (url, key, rel_dir, added_by, added_at, mode, source) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		url, key, relDir, addedBy, time.Now().Unix(), mode, source)
 	if err != nil {
 		return nil, err
 	}
@@ -426,10 +490,18 @@ func (s *Store) HasRelease(ctx context.Context, repoID int64, tag string) (bool,
 	return n > 0, err
 }
 
-func (s *Store) AddRelease(ctx context.Context, repoID int64, tag, name string, published time.Time) error {
+// AddRelease records an archived release. metaOnly means only its notes and metadata were
+// saved, not its files.
+func (s *Store) AddRelease(ctx context.Context, repoID int64, tag, name string, published time.Time, metaOnly bool) error {
 	_, err := s.db.ExecContext(ctx,
-		`INSERT OR REPLACE INTO releases (repo_id, tag, name, published_at, archived_at) VALUES (?, ?, ?, ?, ?)`,
-		repoID, tag, name, unix(published), time.Now().Unix())
+		`INSERT OR REPLACE INTO releases (repo_id, tag, name, published_at, archived_at, meta_only) VALUES (?, ?, ?, ?, ?, ?)`,
+		repoID, tag, name, unix(published), time.Now().Unix(), metaOnly)
+	return err
+}
+
+// SetReleaseMetaOnly records that a release's files were removed and only its notes remain.
+func (s *Store) SetReleaseMetaOnly(ctx context.Context, repoID int64, tag string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE releases SET meta_only = 1 WHERE repo_id = ? AND tag = ?`, repoID, tag)
 	return err
 }
 
@@ -468,11 +540,12 @@ type ArchivedRelease struct {
 	Tag       string
 	Name      string
 	Published time.Time
+	MetaOnly  bool // notes and metadata only, no files
 }
 
 // ArchivedReleases lists a repository's archived releases.
 func (s *Store) ArchivedReleases(ctx context.Context, repoID int64) ([]ArchivedRelease, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT tag, name, published_at FROM releases WHERE repo_id = ?`, repoID)
+	rows, err := s.db.QueryContext(ctx, `SELECT tag, name, published_at, meta_only FROM releases WHERE repo_id = ?`, repoID)
 	if err != nil {
 		return nil, err
 	}
@@ -481,7 +554,7 @@ func (s *Store) ArchivedReleases(ctx context.Context, repoID int64) ([]ArchivedR
 	for rows.Next() {
 		var r ArchivedRelease
 		var ts int64
-		if err := rows.Scan(&r.Tag, &r.Name, &ts); err != nil {
+		if err := rows.Scan(&r.Tag, &r.Name, &ts, &r.MetaOnly); err != nil {
 			return nil, err
 		}
 		r.Published = fromUnix(ts)

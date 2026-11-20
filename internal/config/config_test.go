@@ -49,3 +49,38 @@ check_interval: 5s`))
 		}
 	}
 }
+
+func TestParseLightAndSources(t *testing.T) {
+	base := `
+matrix: {homeserver: "https://m.example.org", user_id: "@b:example.org", password: x, room_id: "!r:example.org", pickle_key: k}
+`
+	cfg, err := Parse([]byte(base + `
+sources:
+  - {name: recomps, url: "http://recompbot:8080/api/recomps", interval: 30m, mode: Full}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := cfg.Light
+	if l.CheckInterval != 12*time.Hour || l.MaxClonesPerCycle != 50 || !l.Releases.DownloadAssets || l.Releases.KeepLast != 1 || l.Releases.MaxAssetSize != 200<<20 {
+		t.Errorf("light defaults: %+v", l)
+	}
+	if s := cfg.Sources[0]; s.Interval != 30*time.Minute || s.Mode != ModeFull || s.URLField != "url" {
+		t.Errorf("source: %+v", s)
+	}
+	_, err = Parse([]byte(base + `
+light: {check_interval: 1s, releases: {keep_last: -1}}
+sources:
+  - {name: a, url: "file:///etc/passwd"}
+  - {name: a, url: "https://x.example.org/list", mode: heavy}
+  - {url: "https://x.example.org/list"}
+`))
+	if err == nil {
+		t.Fatal("expected errors")
+	}
+	for _, want := range []string{"light.check_interval", "light.releases.keep_last", "sources[0].url", "used twice", "sources[1].mode", "sources[2].name"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("missing %q in %v", want, err)
+		}
+	}
+}

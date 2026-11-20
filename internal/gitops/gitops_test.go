@@ -26,6 +26,11 @@ func TestParseRepoURL(t *testing.T) {
 		{"https://user.github.io/proj/docs/index.html", "github.com/user/proj", "user", "proj"},
 		{"https://user.github.io", "github.com/user/user.github.io", "user", "user.github.io"},
 		{"https://user.github.io/index.html", "github.com/user/user.github.io", "user", "user.github.io"},
+		// Links to files and pages inside a GitHub repository reduce to the repository.
+		{"https://github.com/o/r/tree/main/src", "github.com/o/r", "o", "r"},
+		{"https://github.com/o/r/releases/tag/v1", "github.com/o/r", "o", "r"},
+		{"https://www.github.com/o/r", "github.com/o/r", "o", "r"},
+		{"https://raw.githubusercontent.com/o/r/main/docs/banner.png", "github.com/o/r", "o", "r"},
 	}
 	for _, c := range ok {
 		u, err := ParseRepoURL(c.in)

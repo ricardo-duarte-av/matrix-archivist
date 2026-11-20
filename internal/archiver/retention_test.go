@@ -112,7 +112,8 @@ forges: [{host: git.invalid, type: github, api_url: %q}]
 	u, _ := gitops.ParseRepoURL(repo.URL)
 	run := func(cfg *config.Config) (newTags, pruned []string) {
 		a := New(cfg, st, zerolog.Nop())
-		n, p, w := a.archiveReleases(ctx, repo, u, zerolog.Nop())
+		rr := a.archiveReleases(ctx, repo, u, zerolog.Nop())
+		n, p, w := rr.New, rr.Pruned, rr.Warnings
 		if len(w) > 0 {
 			t.Fatalf("warnings: %v", w)
 		}

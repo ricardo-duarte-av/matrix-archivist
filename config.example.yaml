@@ -92,6 +92,40 @@ http:
     name: Archive activity
     pin: false            # both widgets pinned = side by side at the top
 
+# Light archiving, for repositories added in bulk (by a source below, `add --light`, or the
+# `light` command): a bare mirror with the full git history but no checkout, the notes of every
+# release but the files of the newest one(s) only, and no @room alerts for failures or
+# force-pushes (they appear in the daily summary). Takedown alerts are sent as usual.
+light:
+  check_interval: 12h       # how often each light repository is checked (>= 1m)
+  max_clones_per_cycle: 50  # first-time clones per check cycle, so a big import trickles in (0 = no cap)
+  releases:
+    download_assets: true
+    keep_last: 1            # releases that keep their files, newest first (0 = all)
+    max_asset_size: 200MB   # larger files are skipped (0 = unlimited)
+    max_repo_size: ""       # optional cap on git data + release files
+
+# Lists of repositories to archive automatically. Each is fetched every `interval`; new entries
+# are added (cloned by the next check cycles) and entries that disappear are tagged `delisted`,
+# never deleted. A repository removed with `remove` is not added back (until `add`ed again).
+# The response can be a JSON array of objects or of URL strings, or text with one URL per line.
+sources: []
+#  - name: recomps                               # one word; shown in messages and `info`
+#    url: http://recompbot:8080/api/recomps      # recomps-ai-bot's JSON list
+#    interval: 15m
+#    mode: light                                 # light (default) or full
+#    tags: [recomps]                             # added to every repository from this source
+#    url_field: url                              # JSON field with the repository URL
+#    tag_fields: [kind, system]                  # JSON fields whose values become tags
+#    note_fields: [game, system]                 # JSON fields joined into the note: "Game · System"
+#    # Room notice for each repository added (Go text/template over the entry's JSON fields,
+#    # plus .repo, .id, .mode and a `list` function: "A, B and C"). When one sync adds more than
+#    # 10 (e.g. the first sync of an existing list), a single grouped notice is sent instead.
+#    announce: >-
+#      Adding {{.repo}}, {{if eq .kind "toolkit"}}a toolkit for {{.system}}{{else}}a
+#      {{if eq .kind "reimpl"}}reimplementation{{else}}{{.kind}}{{end}} of **{{.game}}**
+#      from {{.system}}{{with .oses}}, for {{list .}}{{end}}{{end}}
+
 # Release APIs. github.com, gitlab.com, codeberg.org and a few other well-known hosts are detected
 # automatically, and unknown hosts are probed for a Gitea/Forgejo or GitLab API.
 # Add entries for tokens (higher rate limits / private repos) or self-hosted forges.

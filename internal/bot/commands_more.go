@@ -103,7 +103,13 @@ func (b *Bot) cmdInfo(evt *event.Event, args []string) {
 	}
 	b.arch.Annotate(r)
 	d := b.arch.Details(b.ctx, r, 5)
-	nrel, _ := b.store.ReleaseCount(b.ctx, r.ID)
+	archived, _ := b.store.ArchivedReleases(b.ctx, r.ID)
+	nrel, notesOnly := len(archived), 0
+	for _, a := range archived {
+		if a.MetaOnly {
+			notesOnly++
+		}
+	}
 	latest, published, _ := b.store.LatestRelease(b.ctx, r.ID)
 
 	m := &rich{}
@@ -118,6 +124,14 @@ func (b *Bot) cmdInfo(evt *event.Event, args []string) {
 
 	kv := func(k string, v cell) []cell { return []cell{cell{"<strong>" + k + "</strong>", k}, v} }
 	rows := [][]cell{kv("State", textCell(repoState(r)))}
+	mode := "full: checkout and releases within the release limits"
+	if r.Mode == store.ModeLight {
+		mode = fmt.Sprintf("light: git history and every release's notes, files of the newest only; checked every %s", b.cfg.Light.CheckInterval)
+	}
+	if r.Source != "" {
+		mode += fmt.Sprintf(" · added by source %s", r.Source)
+	}
+	rows = append(rows, kv("Mode", textCell(mode)))
 	if r.Upstream != "" {
 		rows = append(rows, kv("Upstream", textCell(fmt.Sprintf("%s since %s", r.UpstreamDetail, r.UpstreamSince.Format("2006-01-02 15:04 MST")))))
 	}
@@ -137,7 +151,11 @@ func (b *Bot) cmdInfo(evt *event.Event, args []string) {
 		rows = append(rows, kv("Default branch", mdCell("`"+d.Branch+"`")))
 	}
 	if nrel > 0 {
-		rows = append(rows, kv("Releases", textCell(fmt.Sprintf("%d archived (latest: %s, %s)", nrel, latest, published.Format("2006-01-02")))))
+		what := fmt.Sprintf("%d archived", nrel)
+		if notesOnly > 0 {
+			what = fmt.Sprintf("%d archived, %d of them notes only", nrel, notesOnly)
+		}
+		rows = append(rows, kv("Releases", textCell(fmt.Sprintf("%s (latest: %s, %s)", what, latest, published.Format("2006-01-02")))))
 	} else {
 		rows = append(rows, kv("Releases", textCell("none archived")))
 	}
@@ -317,6 +335,7 @@ type ExportFile struct {
 
 type ExportEntry struct {
 	URL     string    `json:"url"`
+	Mode    string    `json:"mode,omitempty"` // "light"; empty means full
 	Notes   string    `json:"notes,omitempty"`
 	Tags    []string  `json:"tags,omitempty"`
 	AddedBy string    `json:"added_by,omitempty"`
@@ -329,7 +348,11 @@ const exportFormat = "matrix-archivist/v1"
 func Export(repos []*store.Repo, now time.Time) []byte {
 	f := ExportFile{Format: exportFormat, ExportedAt: now.UTC(), Repos: []ExportEntry{}}
 	for _, r := range repos {
-		f.Repos = append(f.Repos, ExportEntry{URL: r.URL, Notes: r.Notes, Tags: r.Tags, AddedBy: r.AddedBy, AddedAt: r.AddedAt.UTC()})
+		e := ExportEntry{URL: r.URL, Notes: r.Notes, Tags: r.Tags, AddedBy: r.AddedBy, AddedAt: r.AddedAt.UTC()}
+		if r.Mode == store.ModeLight {
+			e.Mode = store.ModeLight
+		}
+		f.Repos = append(f.Repos, e)
 	}
 	out, _ := json.MarshalIndent(f, "", "  ")
 	return append(out, '\n')
@@ -412,7 +435,12 @@ func (b *Bot) cmdImport(evt *event.Event, _ []string) {
 			}
 			continue
 		}
-		repo, err := b.store.AddRepo(b.ctx, u.Raw, u.Key(), u.RelDir(), evt.Sender.String())
+		mode := store.ModeFull
+		if e.Mode == store.ModeLight {
+			mode = store.ModeLight
+		}
+		_ = b.store.Unignore(b.ctx, u.Key())
+		repo, err := b.store.AddRepoMode(b.ctx, u.Raw, u.Key(), u.RelDir(), evt.Sender.String(), mode, "")
 		switch {
 		case errors.Is(err, store.ErrDuplicate):
 			existing++

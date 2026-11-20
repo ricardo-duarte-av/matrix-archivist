@@ -111,6 +111,11 @@ type Result struct {
 	// StillGone is set when the repo was already flagged gone upstream and a probe found it
 	// still missing, so the fetch was skipped (no error, no fail count, quiet feed).
 	StillGone string
+	// FilledReleases already had their notes archived and now got their files too (the
+	// repository switched to full mode, or its limits were raised).
+	FilledReleases []string
+	// Checkout is "created" or "removed" when a mode switch added or dropped the checkout.
+	Checkout string
 
 	url    gitops.RepoURL
 	urlOK  bool
@@ -136,8 +141,18 @@ func (r Result) Text() string {
 	if n := len(r.NewReleases); n > 0 {
 		parts = append(parts, releasesText(r.NewReleases))
 	}
+	if r.Checkout != "" {
+		parts = append(parts, "checkout "+r.Checkout)
+	}
+	if n := len(r.FilledReleases); n > 0 {
+		parts = append(parts, fmt.Sprintf("downloaded the files of %d earlier release(s)", n))
+	}
 	if n := len(r.PrunedReleases); n > 0 {
-		parts = append(parts, fmt.Sprintf("removed %d old release(s) to stay within the release limits", n))
+		if r.Repo != nil && r.Repo.Mode == store.ModeLight {
+			parts = append(parts, fmt.Sprintf("removed the files of %d older release(s), keeping their notes", n))
+		} else {
+			parts = append(parts, fmt.Sprintf("removed %d old release(s) to stay within the release limits", n))
+		}
 	}
 	if len(parts) == 0 {
 		parts = append(parts, "up to date")
@@ -253,7 +268,18 @@ func (a *Archiver) check(ctx context.Context, id int64) Result {
 	}
 	res.branch = a.git.DefaultBranch(gctx, mirror)
 
-	if res.Cloned || !res.Change.Empty() || !dirExists(a.checkoutDir(repo)) {
+	if repo.Mode == store.ModeLight {
+		// Light archives keep only the mirror; drop a checkout left from full mode.
+		if dirExists(a.checkoutDir(repo)) {
+			if err := os.RemoveAll(a.checkoutDir(repo)); err != nil {
+				res.Warnings = append(res.Warnings, "removing checkout: "+oneLine(err.Error()))
+			}
+			res.Checkout = "removed"
+		}
+	} else if res.Cloned || !res.Change.Empty() || !dirExists(a.checkoutDir(repo)) {
+		if !res.Cloned && !dirExists(a.checkoutDir(repo)) {
+			res.Checkout = "created"
+		}
 		slot.SetStep("Updating checkout", "")
 		if err := a.git.SyncCheckout(gctx, mirror, a.checkoutDir(repo)); err != nil {
 			res.Warnings = append(res.Warnings, "checkout: "+oneLine(err.Error()))
@@ -261,9 +287,9 @@ func (a *Archiver) check(ctx context.Context, id int64) Result {
 	}
 
 	if a.cfg.Releases.Enabled {
-		tags, pruned, warns := a.archiveReleases(ctx, repo, u, log)
-		res.NewReleases, res.PrunedReleases = tags, pruned
-		res.Warnings = append(res.Warnings, warns...)
+		rr := a.archiveReleases(ctx, repo, u, log)
+		res.NewReleases, res.FilledReleases, res.PrunedReleases = rr.New, rr.Filled, rr.Pruned
+		res.Warnings = append(res.Warnings, rr.Warnings...)
 	}
 	return a.finish(ctx, res, log)
 }
@@ -295,7 +321,9 @@ func (a *Archiver) finish(ctx context.Context, res Result, log zerolog.Logger) R
 		}
 		// Archives of repos that vanished upstream still get their README indexed.
 		a.updateMeta(ctx, res, false, log)
-		if n := repo.FailCount + 1; !alerted && a.cfg.FailureAlert > 0 && n == a.cfg.FailureAlert {
+		// Light repositories (typically added in bulk by a source) only show failures in the
+		// summary; disappearing upstream is still alerted above.
+		if n := repo.FailCount + 1; !alerted && repo.Mode != store.ModeLight && a.cfg.FailureAlert > 0 && n == a.cfg.FailureAlert {
 			a.Alert(ctx, FailureAlertText(repo, n, res.Err))
 		}
 	default:
@@ -308,11 +336,11 @@ func (a *Archiver) finish(ctx context.Context, res Result, log zerolog.Logger) R
 		} else if wasFailing {
 			_ = a.store.AddEvent(ctx, repo.ID, store.EventRecovered, "recovered")
 			// Only announce recovery if the room was alerted about the failure.
-			if a.cfg.FailureAlert > 0 && repo.FailCount >= a.cfg.FailureAlert {
+			if repo.Mode != store.ModeLight && a.cfg.FailureAlert > 0 && repo.FailCount >= a.cfg.FailureAlert {
 				a.Notify(ctx, fmt.Sprintf("✅ **#%d** %s is working again after %d failed checks.", repo.ID, repo.URL, repo.FailCount))
 			}
 		}
-		if res.Changed() || len(res.PrunedReleases) > 0 || repo.SizeBytes == 0 {
+		if res.Changed() || len(res.PrunedReleases) > 0 || len(res.FilledReleases) > 0 || res.Checkout != "" || repo.SizeBytes == 0 {
 			_ = a.store.SetSize(ctx, repo.ID, gitops.DirSize(a.RepoDir(repo)))
 		}
 		if res.Cloned {
@@ -339,7 +367,9 @@ func (a *Archiver) finish(ctx context.Context, res Result, log zerolog.Logger) R
 		case len(res.PrunedReleases) > 0:
 			a.Live.Event(repo.ID, repo.URL, "prune", res.Text())
 		}
-		if text := RewriteNoticeText(repo, res.Change, res.branch); text != "" {
+		// Rewrites in light repositories are preserved the same way but only reported in
+		// the summary.
+		if text := RewriteNoticeText(repo, res.Change, res.branch); text != "" && repo.Mode != store.ModeLight {
 			a.Notify(ctx, text)
 		}
 		log.Debug().Str("result", res.Text()).Msg("Checked repository")
@@ -489,69 +519,106 @@ func (a *Archiver) provider(ctx context.Context, host string) forge.Provider {
 	return p
 }
 
-func (a *Archiver) archiveReleases(ctx context.Context, repo *store.Repo, u gitops.RepoURL, log zerolog.Logger) (newTags, pruned, warnings []string) {
+// releaseResult is what archiveReleases did.
+type releaseResult struct {
+	New      []string // releases archived for the first time
+	Filled   []string // releases that had notes only and got their files
+	Pruned   []string // releases removed (or reduced to notes) by the retention limits
+	Warnings []string
+}
+
+func (a *Archiver) archiveReleases(ctx context.Context, repo *store.Repo, u gitops.RepoURL, log zerolog.Logger) (out releaseResult) {
 	if u.Owner == "" {
-		return nil, nil, nil
+		return out
 	}
 	p := a.provider(ctx, u.Host)
 	if p == nil {
-		return nil, nil, nil
+		return out
 	}
 	slot := live.From(ctx)
 	slot.SetStep("Listing releases", "")
 	rels, err := p.ListReleases(ctx, u.Owner, u.Name)
 	if errors.Is(err, forge.ErrNoRepo) {
-		return nil, nil, nil
+		return out
 	} else if err != nil {
 		log.Warn().Err(err).Msg("Failed to list releases")
-		return nil, nil, []string{"releases: " + oneLine(err.Error())}
+		out.Warnings = []string{"releases: " + oneLine(err.Error())}
+		return out
 	}
-	cands, err := a.releaseCandidates(ctx, repo, rels)
+	pol := a.releasePolicy(repo)
+	cands, err := a.releaseCandidates(ctx, repo, pol, rels)
 	if err != nil {
-		return nil, nil, []string{"releases: " + oneLine(err.Error())}
+		out.Warnings = []string{"releases: " + oneLine(err.Error())}
+		return out
 	}
-	var todo []ReleaseCandidate
-	for _, c := range a.planReleases(repo, cands) {
-		if !c.Archived {
-			todo = append(todo, c)
+	// Releases to download with their files: in the plan and not archived with them yet.
+	// In light mode, every other release not archived yet gets its notes only.
+	type job struct {
+		c     ReleaseCandidate
+		files bool
+	}
+	var todo []job
+	planned := map[string]bool{}
+	for _, c := range a.planReleases(repo, pol, cands) {
+		planned[c.Tag] = true
+		if (!c.Archived || c.MetaOnly) && c.Release != nil {
+			todo = append(todo, job{c, true})
 		}
 	}
-	for i, c := range todo {
+	if pol.allNotes {
+		for _, c := range cands {
+			if !planned[c.Tag] && !c.Archived && c.Release != nil {
+				todo = append(todo, job{c, false})
+			}
+		}
+	}
+	for i, j := range todo {
 		if ctx.Err() != nil {
 			break
 		}
-		rel := *c.Release
+		rel := *j.c.Release
 		label := fmt.Sprintf("%s (%d/%d)", rel.Tag, i+1, len(todo))
 		slot.SetStep("Archiving release", label)
 		dir := filepath.Join(a.releasesDir(repo), forge.SafeName(rel.Tag))
-		complete, skipped, err := a.saveRelease(ctx, rel, dir, label)
+		files := j.files && pol.downloadAssets
+		complete, skipped, err := a.saveRelease(ctx, rel, dir, label, files, pol.maxAssetSize)
 		if err != nil {
 			log.Warn().Err(err).Str("tag", rel.Tag).Msg("Failed to archive release")
-			warnings = append(warnings, fmt.Sprintf("release %s: %s", rel.Tag, oneLine(err.Error())))
+			out.Warnings = append(out.Warnings, fmt.Sprintf("release %s: %s", rel.Tag, oneLine(err.Error())))
 			continue
 		}
 		if len(skipped) > 0 {
-			warnings = append(warnings, fmt.Sprintf("release %s: skipped oversized assets %s", rel.Tag, strings.Join(skipped, ", ")))
+			out.Warnings = append(out.Warnings, fmt.Sprintf("release %s: skipped oversized assets %s", rel.Tag, strings.Join(skipped, ", ")))
 		}
 		if complete {
-			_ = a.store.AddRelease(ctx, repo.ID, rel.Tag, rel.Name, rel.Published)
-			newTags = append(newTags, rel.Tag)
+			_ = a.store.AddRelease(ctx, repo.ID, rel.Tag, rel.Name, rel.Published, pol.allNotes && !files)
+			if !j.c.Archived {
+				out.New = append(out.New, rel.Tag)
+			} else if files {
+				out.Filled = append(out.Filled, rel.Tag)
+			}
 			log.Info().Str("tag", rel.Tag).Msg("Archived release")
 		}
 	}
-	if a.cfg.Releases.Limited() && ctx.Err() == nil {
+	if (pol.limited() || pol.allNotes) && ctx.Err() == nil {
 		// Re-plan with the real sizes now on disk and remove what no longer fits.
 		slot.SetStep("Applying release limits", "")
-		pruned, err = a.pruneReleases(ctx, repo, rels, log)
+		pruned, err := a.pruneReleases(ctx, repo, pol, rels, log)
 		if err != nil {
-			warnings = append(warnings, "pruning releases: "+oneLine(err.Error()))
+			out.Warnings = append(out.Warnings, "pruning releases: "+oneLine(err.Error()))
 		}
-		newTags = slices.DeleteFunc(newTags, func(t string) bool { return slices.Contains(pruned, t) })
+		out.Pruned = pruned
+		// In full mode, a release pruned right after its download wasn't archived after all.
+		if !pol.allNotes {
+			out.New = slices.DeleteFunc(out.New, func(t string) bool { return slices.Contains(pruned, t) })
+		}
 	}
-	return newTags, pruned, warnings
+	return out
 }
 
-func (a *Archiver) saveRelease(ctx context.Context, rel forge.Release, dir, label string) (complete bool, skipped []string, err error) {
+// saveRelease writes a release's notes and metadata to dir and, with files, downloads its
+// assets (skipping those over maxAsset bytes).
+func (a *Archiver) saveRelease(ctx context.Context, rel forge.Release, dir, label string, files bool, maxAsset int64) (complete bool, skipped []string, err error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return false, nil, err
 	}
@@ -572,14 +639,14 @@ func (a *Archiver) saveRelease(ctx context.Context, rel forge.Release, dir, labe
 	if err := os.WriteFile(filepath.Join(dir, "notes.md"), []byte(notes), 0o644); err != nil {
 		return false, nil, err
 	}
-	if !a.cfg.Releases.DownloadAssets {
+	if !files {
 		return true, nil, nil
 	}
 	complete = true
 	var firstErr error
 	for i, asset := range rel.Assets {
 		live.From(ctx).SetStep("Downloading release", fmt.Sprintf("%s · asset %d/%d: %s", label, i+1, len(rel.Assets), asset.Name))
-		_, err := a.forge.Download(ctx, asset, filepath.Join(dir, "assets"), a.cfg.Releases.MaxAssetSize)
+		_, err := a.forge.Download(ctx, asset, filepath.Join(dir, "assets"), maxAsset)
 		switch {
 		case err == nil:
 		case errors.Is(err, forge.ErrTooLarge):
@@ -594,9 +661,39 @@ func (a *Archiver) saveRelease(ctx context.Context, rel forge.Release, dir, labe
 	return complete, skipped, firstErr
 }
 
-// RunCycle checks all repositories with bounded concurrency. Returns false if a cycle was
-// already running.
-func (a *Archiver) RunCycle(ctx context.Context) (results []Result, ran bool) {
+// DueRepos picks the repositories a check cycle should check, in order: every full
+// repository, then light ones whose own check interval has passed (all of them with force),
+// then light ones not cloned yet, at most light.max_clones_per_cycle of those.
+func (a *Archiver) DueRepos(repos []*store.Repo, now time.Time, force bool) []int64 {
+	var full, light, clones []*store.Repo
+	// A light repo is due slightly early so it isn't pushed back by a whole cycle each time.
+	interval := a.cfg.Light.CheckInterval - a.cfg.CheckInterval/2
+	for _, r := range repos {
+		switch {
+		case r.Mode != store.ModeLight:
+			full = append(full, r)
+		case !r.Cloned && r.FailCount == 0:
+			clones = append(clones, r)
+		case force || now.Sub(r.LastChecked) >= interval:
+			light = append(light, r)
+		}
+	}
+	if max := a.cfg.Light.MaxClonesPerCycle; max > 0 && len(clones) > max {
+		clones = clones[:max]
+	}
+	var ids []int64
+	for _, group := range [][]*store.Repo{full, light, clones} {
+		for _, r := range group {
+			ids = append(ids, r.ID)
+		}
+	}
+	return ids
+}
+
+// RunCycle checks the repositories that are due (see DueRepos) with bounded concurrency.
+// With force, light repositories are checked whatever their interval. Returns false if a
+// cycle was already running.
+func (a *Archiver) RunCycle(ctx context.Context, force bool) (results []Result, ran bool) {
 	if !a.cycleRunning.CompareAndSwap(false, true) {
 		return nil, false
 	}
@@ -608,13 +705,14 @@ func (a *Archiver) RunCycle(ctx context.Context) (results []Result, ran bool) {
 		return nil, true
 	}
 	start := time.Now()
-	a.log.Info().Int("repos", len(repos)).Msg("Starting check cycle")
-	ids := make([]int64, len(repos))
-	for i, r := range repos {
-		ids[i] = r.ID
-	}
+	ids := a.DueRepos(repos, start, force)
+	a.log.Info().Int("repos", len(ids)).Int("tracked", len(repos)).Msg("Starting check cycle")
 	a.Live.CycleStart(len(ids))
-	a.Live.Event(0, "", "info", fmt.Sprintf("Check cycle started (%d repositories)", len(ids)))
+	what := fmt.Sprintf("%d repositories", len(ids))
+	if len(ids) < len(repos) {
+		what = fmt.Sprintf("%d of %d repositories; the other light ones aren't due yet", len(ids), len(repos))
+	}
+	a.Live.Event(0, "", "info", "Check cycle started ("+what+")")
 	results = a.checkMany(ctx, ids, true)
 	took := time.Since(start)
 	a.Live.CycleEnd()
@@ -693,6 +791,9 @@ func (a *Archiver) checkMany(ctx context.Context, ids []int64, cycle bool) (resu
 // Run executes the periodic check loop and summary scheduler until ctx is cancelled.
 func (a *Archiver) Run(ctx context.Context) {
 	go a.runSummaries(ctx)
+	for _, src := range a.cfg.Sources {
+		go a.runSource(ctx, src)
+	}
 
 	// Give the bot a moment to connect before the first cycle.
 	select {
@@ -704,7 +805,7 @@ func (a *Archiver) Run(ctx context.Context) {
 	defer ticker.Stop()
 	for {
 		a.Live.SetNext(time.Now().Add(a.cfg.CheckInterval))
-		a.RunCycle(ctx)
+		a.RunCycle(ctx, false)
 		select {
 		case <-ticker.C:
 		case <-ctx.Done():

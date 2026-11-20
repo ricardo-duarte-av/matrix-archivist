@@ -73,6 +73,20 @@ func githubPages(host, p string) (string, string, bool) {
 	return "github.com", user + "/" + first, true
 }
 
+// githubRepoPath reduces links to a file or page inside a GitHub repository
+// (github.com/o/r/tree/main/…, github.com/o/r/releases, raw.githubusercontent.com/o/r/main/…)
+// to the repository's owner/name. GitHub repositories are always exactly two levels deep.
+func githubRepoPath(host, p string) (string, bool) {
+	if host != "github.com" && host != "www.github.com" && host != "raw.githubusercontent.com" {
+		return "", false
+	}
+	segs := strings.Split(strings.Trim(p, "/"), "/")
+	if len(segs) < 2 || (len(segs) == 2 && host == "github.com") {
+		return "", false
+	}
+	return segs[0] + "/" + segs[1], true
+}
+
 // ParseRepoURL validates a user-supplied git URL. Only network transports are allowed
 // (https, http, ssh, git, and scp-style user@host:path); local paths and file:// are rejected.
 func ParseRepoURL(raw string) (RepoURL, error) {
@@ -128,6 +142,9 @@ func ParseRepoURL(raw string) (RepoURL, error) {
 		if h, rp, ok := githubPages(host, p); ok {
 			host, p = h, rp
 			raw = "https://" + h + "/" + rp
+		} else if rp, ok := githubRepoPath(host, p); ok {
+			host, p = "github.com", rp
+			raw = "https://github.com/" + rp
 		}
 	}
 

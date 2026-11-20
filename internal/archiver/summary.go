@@ -15,6 +15,9 @@ import (
 
 const lastSummaryKey = "last_summary"
 
+// summaryListMax is how many light repositories the summary lists before only counting them.
+const summaryListMax = 10
+
 // NextSummary returns the next occurrence of hh:mm in loc strictly after now.
 func NextSummary(now time.Time, hour, minute int, loc *time.Location) time.Time {
 	n := now.In(loc)
@@ -122,7 +125,10 @@ func (a *Archiver) BuildSummary(ctx context.Context, since time.Time) (text stri
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 
-	var updated, failing, gone []string
+	// Light repositories are usually many and added in bulk: they are counted, and listed
+	// only when there are few.
+	var updated, failing, gone, lightUpdated, lightFailing []string
+	lightAdded, lightReleases, lightCount := 0, 0, 0
 	for _, id := range ids {
 		ra := act[id]
 		r := byID[id]
@@ -139,9 +145,19 @@ func (a *Archiver) BuildSummary(ctx context.Context, since time.Time) (text stri
 		if len(ra.releases) > 0 {
 			parts = append(parts, "🏷️ "+releasesText(ra.releases))
 		}
-		if len(parts) > 0 {
-			updated = append(updated, fmt.Sprintf("- **#%d** %s — %s", id, r.URL, strings.Join(parts, "; ")))
+		if len(parts) == 0 {
+			continue
 		}
+		line := fmt.Sprintf("- **#%d** %s — %s", id, r.URL, strings.Join(parts, "; "))
+		if r.Mode == store.ModeLight {
+			lightUpdated = append(lightUpdated, line)
+			lightReleases += len(ra.releases)
+			if ra.added != "" {
+				lightAdded++
+			}
+			continue
+		}
+		updated = append(updated, line)
 	}
 	// Every repository that is failing right now, whether or not it had events in the window.
 	for _, r := range repos {
@@ -151,23 +167,63 @@ func (a *Archiver) BuildSummary(ctx context.Context, since time.Time) (text stri
 			continue
 		}
 		if r.FailCount > 0 {
-			failing = append(failing, fmt.Sprintf("- **#%d** %s — %d failures in a row, last: `%s`", r.ID, r.URL, r.FailCount, oneLine(r.LastError)))
+			line := fmt.Sprintf("- **#%d** %s — %d failures in a row, last: `%s`", r.ID, r.URL, r.FailCount, oneLine(r.LastError))
+			if r.Mode == store.ModeLight {
+				lightFailing = append(lightFailing, line)
+			} else {
+				failing = append(failing, line)
+			}
+		}
+	}
+	for _, r := range repos {
+		if r.Mode == store.ModeLight {
+			lightCount++
 		}
 	}
 
-	if len(updated) == 0 {
-		b.WriteString("No repositories changed.\n")
-	} else {
+	switch {
+	case len(updated) > 0:
 		fmt.Fprintf(&b, "**Updated (%d):**\n\n%s\n", len(updated), strings.Join(updated, "\n"))
+	case len(lightUpdated) == 0:
+		b.WriteString("No repositories changed.\n")
+	}
+	if n := len(lightUpdated); n > 0 {
+		fmt.Fprintf(&b, "\n**Light archives updated (%d)**", n)
+		var extra []string
+		if lightAdded > 0 {
+			extra = append(extra, fmt.Sprintf("%d newly archived", lightAdded))
+		}
+		if lightReleases > 0 {
+			extra = append(extra, fmt.Sprintf("%d new releases", lightReleases))
+		}
+		if len(extra) > 0 {
+			fmt.Fprintf(&b, ": %s", strings.Join(extra, ", "))
+		}
+		b.WriteString("\n")
+		if n <= summaryListMax {
+			fmt.Fprintf(&b, "\n%s\n", strings.Join(lightUpdated, "\n"))
+		}
 	}
 	if len(failing) > 0 {
 		fmt.Fprintf(&b, "\n**Failing (%d):**\n\n%s\n", len(failing), strings.Join(failing, "\n"))
 	}
+	if n := len(lightFailing); n > 0 {
+		fmt.Fprintf(&b, "\n**Light archives failing (%d):**\n\n", n)
+		if n > summaryListMax {
+			lightFailing = append(lightFailing[:summaryListMax], fmt.Sprintf("- …and %d more", n-summaryListMax))
+		}
+		fmt.Fprintf(&b, "%s\n", strings.Join(lightFailing, "\n"))
+	}
 	if len(gone) > 0 {
 		fmt.Fprintf(&b, "\n**Gone upstream, preserved here (%d):**\n\n%s\n", len(gone), strings.Join(gone, "\n"))
 	}
-	fmt.Fprintf(&b, "\n_%d repositories tracked._", len(repos))
-	return b.String(), len(updated) == 0 && len(failing) == 0, nil
+	if lightCount > 0 {
+		fmt.Fprintf(&b, "\n_%d repositories tracked (%d light)._", len(repos), lightCount)
+	} else {
+		fmt.Fprintf(&b, "\n_%d repositories tracked._", len(repos))
+	}
+	empty = len(updated) == 0 && len(failing) == 0 && len(lightUpdated) == 0 && len(lightFailing) == 0
+	return b.String(), empty, nil
 }
 
 // MergeChanges combines several consecutive changes into one.
