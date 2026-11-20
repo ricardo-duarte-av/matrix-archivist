@@ -42,6 +42,9 @@ type Archiver struct {
 
 	cycleRunning atomic.Bool
 
+	// sourceInvalid remembers each source's invalid URLs, to log them only when they change.
+	sourceInvalid map[string]string
+
 	// Live is what the archiver is doing right now, for the live activity page.
 	Live *live.Hub
 
@@ -59,15 +62,16 @@ func New(cfg *config.Config, st *store.Store, log zerolog.Logger) *Archiver {
 	hub := live.New(cfg.Concurrency)
 	hub.Disk = func() (uint64, uint64, error) { return FreeSpace(cfg.StorageDir) }
 	return &Archiver{
-		cfg:    cfg,
-		store:  st,
-		git:    gitops.New(),
-		forge:  fc,
-		log:    log,
-		locks:  map[int64]*sync.Mutex{},
-		Notify: func(context.Context, string) {},
-		Alert:  func(context.Context, string) {},
-		Live:   hub,
+		cfg:           cfg,
+		store:         st,
+		git:           gitops.New(),
+		forge:         fc,
+		log:           log,
+		locks:         map[int64]*sync.Mutex{},
+		sourceInvalid: map[string]string{},
+		Notify:        func(context.Context, string) {},
+		Alert:         func(context.Context, string) {},
+		Live:          hub,
 	}
 }
 
@@ -791,15 +795,17 @@ func (a *Archiver) checkMany(ctx context.Context, ids []int64, cycle bool) (resu
 // Run executes the periodic check loop and summary scheduler until ctx is cancelled.
 func (a *Archiver) Run(ctx context.Context) {
 	go a.runSummaries(ctx)
-	for _, src := range a.cfg.Sources {
-		go a.runSource(ctx, src)
-	}
 
 	// Give the bot a moment to connect before the first cycle.
 	select {
 	case <-time.After(10 * time.Second):
 	case <-ctx.Done():
 		return
+	}
+	// Sync the sources first, so what they add is cloned in the first cycle.
+	for _, src := range a.cfg.Sources {
+		a.syncAndReport(ctx, src)
+		go a.runSource(ctx, src)
 	}
 	ticker := time.NewTicker(a.cfg.CheckInterval)
 	defer ticker.Stop()

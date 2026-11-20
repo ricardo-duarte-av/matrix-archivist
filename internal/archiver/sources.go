@@ -111,31 +111,65 @@ func (r SyncResult) Empty() bool {
 	return len(r.Added) == 0 && len(r.Delisted) == 0 && len(r.Relisted) == 0
 }
 
-// runSource syncs one source now and then every interval until ctx is cancelled.
+// runSource syncs one source every interval until ctx is cancelled. The first sync is done
+// by Run, before the first check cycle.
 func (a *Archiver) runSource(ctx context.Context, src config.Source) {
-	log := a.log.With().Str("source", src.Name).Logger()
-	// Give the bot a moment to connect, so the first sync's message reaches the room.
-	select {
-	case <-time.After(10 * time.Second):
-	case <-ctx.Done():
-		return
-	}
 	for {
-		res, err := a.SyncSource(ctx, src)
-		switch {
-		case err != nil && ctx.Err() == nil:
-			log.Warn().Err(err).Msg("Source sync failed")
-		case err == nil:
-			log.Debug().Int("listed", res.Listed).Int("added", len(res.Added)).Msg("Source synced")
-			for _, msg := range SyncMessages(src, res) {
-				a.Notify(ctx, msg)
-			}
-		}
 		select {
 		case <-time.After(src.Interval):
 		case <-ctx.Done():
 			return
 		}
+		a.syncAndReport(ctx, src)
+	}
+}
+
+// syncAndReport syncs a source and reports the outcome in the log, the live activity feed
+// and the room.
+func (a *Archiver) syncAndReport(ctx context.Context, src config.Source) {
+	log := a.log.With().Str("source", src.Name).Logger()
+	res, err := a.SyncSource(ctx, src)
+	if err != nil {
+		if ctx.Err() == nil {
+			log.Warn().Err(err).Msg("Source sync failed")
+			a.Live.Event(0, "", "error", fmt.Sprintf("Source %s: sync failed: %s", src.Name, oneLine(err.Error())))
+		}
+		return
+	}
+	ev := log.Debug()
+	if !res.Empty() {
+		ev = log.Info()
+	}
+	ev.Int("listed", res.Listed).Int("added", len(res.Added)).Int("delisted", len(res.Delisted)).
+		Int("relisted", len(res.Relisted)).Int("invalid", len(res.Invalid)).Msg("Source synced")
+	// Invalid entries are logged with their URLs once, then only again when they change.
+	if inv := strings.Join(res.Invalid, " "); inv != a.sourceInvalid[src.Name] {
+		a.sourceInvalid[src.Name] = inv
+		if len(res.Invalid) > 0 {
+			shown := res.Invalid
+			if len(shown) > 20 {
+				shown = shown[:20]
+			}
+			log.Warn().Int("count", len(res.Invalid)).Strs("urls", shown).Msg("Source lists URLs that aren't valid repository URLs; skipped")
+		}
+	}
+
+	if n := len(res.Added); n > 0 && n <= announceMax {
+		for _, r := range res.Added {
+			a.Live.Event(r.ID, r.URL, "info", fmt.Sprintf("Added by source %s (%s mode); cloned in the next check cycle", src.Name, r.Mode))
+		}
+	} else if n > 0 {
+		a.Live.Event(0, "", "info", fmt.Sprintf("Source %s: %d new repositories queued (%s mode), cloned up to %d per check cycle",
+			src.Name, n, src.Mode, a.cfg.Light.MaxClonesPerCycle))
+	}
+	if n := len(res.Delisted); n > 0 {
+		a.Live.Event(0, "", "info", fmt.Sprintf("Source %s no longer lists %d repositories; tagged %s", src.Name, n, store.TagDelisted))
+	}
+	if n := len(res.Relisted); n > 0 {
+		a.Live.Event(0, "", "info", fmt.Sprintf("Source %s lists %d repositories again", src.Name, n))
+	}
+	for _, msg := range SyncMessages(src, res) {
+		a.Notify(ctx, msg)
 	}
 }
 
