@@ -421,6 +421,11 @@ mirror: {enabled: true, url: %q, public_url: "https://git.example.org/", token: 
 	gitT(t, work, "tag", "v3")
 	gitT(t, a.mirrorDir(repo), "fetch", "-q", work, "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*")
 	writeRelease(t, a, st, repo, "v3", "2026-04-01T00:00:00Z", map[string]string{"game.zip": "zipdata3"}, false)
+	// Creating v3 collides with Forgejo's own processing of the push once (it answers 500);
+	// the retry succeeds.
+	forge.mu.Lock()
+	forge.failNext["POST /repos/Zelda-Ret/oot/releases"] = 500
+	forge.mu.Unlock()
 	os.RemoveAll(filepath.Join(a.releaseDir(repo, "v2"), "assets"))
 	st.SetReleaseMetaOnly(ctx, repo.ID, "v2")
 	st.RemoveRelease(ctx, repo.ID, "v1")

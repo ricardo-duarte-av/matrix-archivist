@@ -663,7 +663,7 @@ func (a *Archiver) syncForgeReleases(ctx context.Context, repo *store.Repo, owne
 		delete(byTag, l.Tag)
 		switch {
 		case !ok:
-			created, err := a.mirror.CreateRelease(ctx, owner, name, opts)
+			created, err := a.createForgeRelease(ctx, owner, name, opts)
 			if err != nil {
 				return changed, files, warnings, fmt.Errorf("release %s: %w", l.Tag, err)
 			}
@@ -721,6 +721,28 @@ func (a *Archiver) syncForgeReleases(ctx context.Context, repo *store.Repo, owne
 		a.log.Debug().Int64("repo_id", repo.ID).Int("releases", missingTags).Msg("Releases without their tag in the archive were not published")
 	}
 	return changed, files, warnings, nil
+}
+
+// createForgeRelease creates a release, retrying server errors for a while: right after a
+// push, Forgejo is still copying the pushed tags into its release table in the background,
+// and a release created for a tag it hasn't copied yet can collide with that copy
+// (500, duplicate key "UQE_release_n"). Once the copy is there, creating the release works.
+func (a *Archiver) createForgeRelease(ctx context.Context, owner, name string, o mirror.ReleaseOptions) (*mirror.Release, error) {
+	delay := a.mirrorEmptyPoll
+	for attempt := 1; ; attempt++ {
+		r, err := a.mirror.CreateRelease(ctx, owner, name, o)
+		var apiErr *mirror.APIError
+		if err == nil || attempt == 5 || !errors.As(err, &apiErr) || apiErr.Status < 500 {
+			return r, err
+		}
+		live.From(ctx).SetStep("Waiting for the forge to process the push", "")
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		delay *= 2
+	}
 }
 
 // unpublishMirror archives (read-only) or, with purge, deletes a removed repository's copy on
