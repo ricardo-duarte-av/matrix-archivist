@@ -20,6 +20,7 @@ import (
 	"github.com/ricardo-duarte-av/matrix-archivist/internal/forge"
 	"github.com/ricardo-duarte-av/matrix-archivist/internal/gitops"
 	"github.com/ricardo-duarte-av/matrix-archivist/internal/live"
+	"github.com/ricardo-duarte-av/matrix-archivist/internal/mirror"
 	"github.com/ricardo-duarte-av/matrix-archivist/internal/store"
 )
 
@@ -48,6 +49,12 @@ type Archiver struct {
 	// Live is what the archiver is doing right now, for the live activity page.
 	Live *live.Hub
 
+	// mirror publishes repositories to a forge (nil when disabled).
+	mirror        *mirror.Client
+	mirrorKick    chan struct{}
+	mirrorReady   atomic.Bool // the forge accepted the token
+	mirrorRunning atomic.Bool
+
 	// Counters exposed as metrics.
 	checksOK, checksFailed atomic.Int64
 	lastCycleEnd           atomic.Int64 // unix seconds
@@ -61,7 +68,7 @@ func New(cfg *config.Config, st *store.Store, log zerolog.Logger) *Archiver {
 	}
 	hub := live.New(cfg.Concurrency)
 	hub.Disk = func() (uint64, uint64, error) { return FreeSpace(cfg.StorageDir) }
-	return &Archiver{
+	a := &Archiver{
 		cfg:           cfg,
 		store:         st,
 		git:           gitops.New(),
@@ -73,6 +80,11 @@ func New(cfg *config.Config, st *store.Store, log zerolog.Logger) *Archiver {
 		Alert:         func(context.Context, string) {},
 		Live:          hub,
 	}
+	if cfg.Mirror.Enabled {
+		a.mirror = mirror.NewClient(cfg.Mirror.URL, cfg.Mirror.Token)
+		a.mirrorKick = make(chan struct{}, 1)
+	}
+	return a
 }
 
 // Annotate fills in Activity for repositories that are being checked right now.
@@ -795,6 +807,9 @@ func (a *Archiver) checkMany(ctx context.Context, ids []int64, cycle bool) (resu
 // Run executes the periodic check loop and summary scheduler until ctx is cancelled.
 func (a *Archiver) Run(ctx context.Context) {
 	go a.runSummaries(ctx)
+	if a.mirror != nil {
+		go a.runMirror(ctx)
+	}
 
 	// Give the bot a moment to connect before the first cycle.
 	select {
@@ -812,6 +827,7 @@ func (a *Archiver) Run(ctx context.Context) {
 	for {
 		a.Live.SetNext(time.Now().Add(a.cfg.CheckInterval))
 		a.RunCycle(ctx, false)
+		a.KickMirror()
 		select {
 		case <-ticker.C:
 		case <-ctx.Done():
@@ -825,9 +841,11 @@ func (a *Archiver) Remove(ctx context.Context, repo *store.Repo, purge bool) err
 	m := a.lock(repo.ID)
 	m.Lock()
 	defer m.Unlock()
+	mst, _, _ := a.store.MirrorState(ctx, repo.ID)
 	if err := a.store.RemoveRepo(ctx, repo.ID); err != nil {
 		return err
 	}
+	a.unpublishMirror(ctx, repo, mst.Path, purge)
 	if purge {
 		if inUse, _ := a.store.RelDirInUse(ctx, repo.RelDir, repo.ID); !inUse {
 			dir := a.RepoDir(repo)

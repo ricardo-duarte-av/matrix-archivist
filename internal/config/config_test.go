@@ -84,3 +84,27 @@ sources:
 		}
 	}
 }
+
+func TestParseMirror(t *testing.T) {
+	const m = `matrix: {homeserver: "https://m.example.org", user_id: "@b:example.org", password: x, room_id: "!r:example.org", pickle_key: k}
+`
+	cfg, err := Parse([]byte(m + `mirror: {enabled: true, url: "http://forgejo:3000/", token: t}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mi := cfg.Mirror
+	if mi.URL != "http://forgejo:3000" || mi.PublicURL != mi.URL || mi.Concurrency != 2 || mi.MaxNewPerCycle != 50 ||
+		!mi.Releases || !mi.ReleaseFiles || !mi.Snapshots {
+		t.Errorf("defaults: %+v", mi)
+	}
+	if got := mi.RepoURL("o/r"); got != "http://forgejo:3000/o/r" {
+		t.Errorf("repo url: %s", got)
+	}
+	_, err = Parse([]byte(m + `mirror: {enabled: true, url: "forgejo:3000"}`))
+	if err == nil || !strings.Contains(err.Error(), "mirror.url") || !strings.Contains(err.Error(), "mirror.token") {
+		t.Errorf("expected url and token errors, got %v", err)
+	}
+	if _, err := Parse([]byte(m + `mirror: {enabled: false, url: "nonsense"}`)); err != nil {
+		t.Errorf("a disabled mirror isn't validated: %v", err)
+	}
+}

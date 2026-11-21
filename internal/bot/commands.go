@@ -25,7 +25,7 @@ type command struct {
 
 var commands map[string]command
 
-var helpOrder = []string{"add", "remove", "list", "search", "info", "note", "tag", "untag", "refresh", "light", "full", "status", "usage", "summary", "export", "import", "help"}
+var helpOrder = []string{"add", "remove", "list", "search", "info", "note", "tag", "untag", "refresh", "light", "full", "status", "forge", "usage", "summary", "export", "import", "help"}
 
 func init() {
 	commands = map[string]command{
@@ -41,6 +41,7 @@ func init() {
 		"light":   {"light <#id|url>…", "Switch to light archiving: git history and release notes, files of the newest release only, no checkout", true, (*Bot).cmdLight},
 		"full":    {"full <#id|url>…", "Switch to full archiving: checkout and every release within the normal limits", true, (*Bot).cmdFull},
 		"status":  {"status [#id|url]", "Overall status (or details about one repository)", false, (*Bot).cmdStatus},
+		"forge":   {"forge [sync <#id|url|all>]", "Forge mirror status, or publish repositories to the forge again now", false, (*Bot).cmdForge},
 		"usage":   {"usage", "Disk usage per repository and free space", false, (*Bot).cmdUsage},
 		"summary": {"summary", "Post the summary of changes since the last scheduled summary", false, (*Bot).cmdSummary},
 		"export":  {"export", "Upload the repository list (with notes and tags) as a JSON file", false, (*Bot).cmdExport},
@@ -146,6 +147,7 @@ func (b *Bot) cmdAdd(evt *event.Event, args []string) {
 	}
 	wg.Wait()
 	done(!failed.Load())
+	b.arch.KickMirror()
 }
 
 // resolve finds a repo by "#3", "3" or URL.
@@ -291,6 +293,7 @@ func (b *Bot) cmdRefresh(evt *event.Event, args []string) {
 		}
 		done(ok)
 		b.replyRich(evt, cycleReport(results)...)
+		b.arch.KickMirror()
 		return
 	}
 	var repos []*store.Repo
@@ -319,6 +322,7 @@ func (b *Bot) cmdRefresh(evt *event.Event, args []string) {
 	}
 	done(ok)
 	b.replyRich(evt, TableMessages("", []string{"#", "Repository", "Result"}, rows, "")...)
+	b.arch.KickMirror()
 }
 
 // cycleReport summarises a batch of checks: a count line and a table of changed and
@@ -377,6 +381,11 @@ func (b *Bot) cmdStatus(evt *event.Event, args []string) {
 	}
 	if u := b.cfg.HTTP.BrowseURL(""); u != "" {
 		rows = append(rows, []cell{textCell("Browse"), linkCell(u, u)})
+	}
+	if b.arch.MirrorEnabled() {
+		if o, err := b.arch.MirrorOverview(b.ctx); err == nil {
+			rows = append(rows, []cell{textCell("Forge mirror"), mdCell(fmt.Sprintf("[%s](%s): %s", b.cfg.Mirror.PublicURL, b.cfg.Mirror.PublicURL, mirrorCounts(o)))})
+		}
 	}
 	if b.cfg.Summary.Enabled {
 		s := b.cfg.Summary

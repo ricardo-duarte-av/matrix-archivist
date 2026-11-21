@@ -186,6 +186,17 @@ var migrations = []string{
 		source     TEXT NOT NULL,
 		ignored_at INTEGER NOT NULL
 	);`,
+	`CREATE TABLE mirror (
+		repo_id       INTEGER PRIMARY KEY REFERENCES repos(id) ON DELETE CASCADE,
+		path          TEXT NOT NULL UNIQUE COLLATE NOCASE,
+		refs_hash     TEXT NOT NULL DEFAULT '',
+		releases_hash TEXT NOT NULL DEFAULT '',
+		meta_hash     TEXT NOT NULL DEFAULT '',
+		synced_at     INTEGER NOT NULL DEFAULT 0,
+		tried_at      INTEGER NOT NULL DEFAULT 0,
+		error         TEXT NOT NULL DEFAULT '',
+		fail_count    INTEGER NOT NULL DEFAULT 0
+	);`,
 }
 
 func (s *Store) migrate(ctx context.Context) error {
@@ -710,4 +721,84 @@ func isDigits(s string) bool {
 		}
 	}
 	return s != ""
+}
+
+// MirrorState is how far a repository's copy on the mirror forge is in sync with the archive.
+type MirrorState struct {
+	RepoID int64
+	// Path is owner/name on the forge ("" until it was first assigned).
+	Path string
+	// Fingerprints of what was last published; a sync with the same fingerprint is skipped.
+	RefsHash, ReleasesHash, MetaHash string
+	SyncedAt                         time.Time // last successful sync
+	TriedAt                          time.Time // last attempt
+	Error                            string
+	FailCount                        int
+}
+
+const mirrorCols = `repo_id, path, refs_hash, releases_hash, meta_hash, synced_at, tried_at, error, fail_count`
+
+func scanMirror(row interface{ Scan(...any) error }) (MirrorState, error) {
+	var m MirrorState
+	var synced, tried int64
+	err := row.Scan(&m.RepoID, &m.Path, &m.RefsHash, &m.ReleasesHash, &m.MetaHash, &synced, &tried, &m.Error, &m.FailCount)
+	m.SyncedAt, m.TriedAt = fromUnix(synced), fromUnix(tried)
+	return m, err
+}
+
+// MirrorStates returns the mirror state of every repository that has one.
+func (s *Store) MirrorStates(ctx context.Context) (map[int64]MirrorState, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+mirrorCols+` FROM mirror`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int64]MirrorState{}
+	for rows.Next() {
+		m, err := scanMirror(rows)
+		if err != nil {
+			return nil, err
+		}
+		out[m.RepoID] = m
+	}
+	return out, rows.Err()
+}
+
+// MirrorState returns a repository's mirror state (ok is false if it has none).
+func (s *Store) MirrorState(ctx context.Context, repoID int64) (m MirrorState, ok bool, err error) {
+	m, err = scanMirror(s.db.QueryRowContext(ctx, `SELECT `+mirrorCols+` FROM mirror WHERE repo_id = ?`, repoID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return MirrorState{RepoID: repoID}, false, nil
+	}
+	return m, err == nil, err
+}
+
+// MirrorPathTaken reports whether another repository already uses a forge path.
+func (s *Store) MirrorPathTaken(ctx context.Context, path string, exceptID int64) (bool, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM mirror WHERE path = ? AND repo_id != ?`, path, exceptID).Scan(&n)
+	return n > 0, err
+}
+
+// SaveMirror stores a repository's mirror state.
+func (s *Store) SaveMirror(ctx context.Context, m MirrorState) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO mirror (`+mirrorCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(repo_id) DO UPDATE SET path = excluded.path, refs_hash = excluded.refs_hash,
+		releases_hash = excluded.releases_hash, meta_hash = excluded.meta_hash, synced_at = excluded.synced_at,
+		tried_at = excluded.tried_at, error = excluded.error, fail_count = excluded.fail_count`,
+		m.RepoID, m.Path, m.RefsHash, m.ReleasesHash, m.MetaHash, unix(m.SyncedAt), unix(m.TriedAt), m.Error, m.FailCount)
+	return err
+}
+
+// ResetMirror forgets what was published for a repository (0 = all), so the next sync
+// publishes everything again; failure back-off is reset too.
+func (s *Store) ResetMirror(ctx context.Context, repoID int64) error {
+	q := `UPDATE mirror SET refs_hash = '', releases_hash = '', meta_hash = '', fail_count = 0, tried_at = 0`
+	var args []any
+	if repoID != 0 {
+		q += ` WHERE repo_id = ?`
+		args = append(args, repoID)
+	}
+	_, err := s.db.ExecContext(ctx, q, args...)
+	return err
 }

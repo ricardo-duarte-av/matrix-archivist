@@ -7,7 +7,7 @@ let offset = 0;          // server clock minus local clock (ms)
 let state = null;
 const feed = [];
 const MAX_FEED = 200;
-const ICONS = { info: "ℹ️", change: "🆕", release: "📦", prune: "🧹", error: "❌", gone: "🪦", recovered: "♻️" };
+const ICONS = { info: "ℹ️", change: "🆕", release: "📦", prune: "🧹", error: "❌", gone: "🪦", recovered: "♻️", mirror: "🪞" };
 
 function el(tag, cls, text) {
   const e = document.createElement(tag);

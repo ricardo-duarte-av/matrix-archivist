@@ -126,6 +126,23 @@ sources: []
 #      {{if eq .kind "reimpl"}}reimplementation{{else}}{{.kind}}{{end}} of **{{.game}}**
 #      from {{.system}}{{with .oses}}, for {{list .}}{{end}}{{end}}
 
+# Publish every archived repository to a Forgejo (or Gitea) instance for browsing: git history
+# (with force-pushed history as archived/<date>/<branch> branches), release notes and the
+# release files the archive kept. The archive is the authority: the forge copy is overwritten
+# from it, and issues, pull requests, wiki, projects, packages and Actions are turned off.
+# github.com/owner/name is published as <forge>/owner/name, one organization per owner.
+mirror:
+  enabled: false
+  url: http://forgejo:3000                # how the archiver reaches the forge (API and git push)
+  public_url: https://git.example.org     # for links in messages (default: url)
+  token: ""                               # scopes: write:organization, write:repository, read:user
+  private: false                          # make the organizations and repositories private
+  concurrency: 2                          # repositories synced at the same time
+  max_new_per_cycle: 50                   # first-time publications per pass, so a backfill trickles in (0 = no cap)
+  releases: true                          # publish release notes
+  release_files: true                     # and upload the release files the archive kept
+  snapshots: true                         # push the history preserved from force pushes and deletions
+
 # Release APIs. github.com, gitlab.com, codeberg.org and a few other well-known hosts are detected
 # automatically, and unknown hosts are probed for a Gitea/Forgejo or GitLab API.
 # Add entries for tokens (higher rate limits / private repos) or self-hosted forges.

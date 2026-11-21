@@ -133,6 +133,42 @@ const (
 	ModeLight = "light"
 )
 
+// Mirror publishes every archived repository to a Forgejo (or Gitea) instance as a read-only
+// copy: git history (with the history preserved from force pushes as archived/… branches and
+// tags), release notes and the release files the archive kept. The archive is the authority;
+// the forge copy is overwritten from it.
+type Mirror struct {
+	Enabled bool `yaml:"enabled"`
+	// URL is where the archiver reaches the forge's API and git (e.g. http://forgejo:3000).
+	URL string `yaml:"url"`
+	// PublicURL is the forge's address for links in messages (default: URL).
+	PublicURL string `yaml:"public_url"`
+	// Token of the forge account that owns the mirrors (scopes: write:organization,
+	// write:repository, read:user).
+	Token string `yaml:"token"`
+	// Private makes the organizations and repositories private.
+	Private bool `yaml:"private"`
+	// Concurrency is the number of repositories synced at the same time.
+	Concurrency int `yaml:"concurrency"`
+	// MaxNewPerCycle caps how many repositories are published for the first time in one pass
+	// (0 = no cap), so the initial backfill trickles in.
+	MaxNewPerCycle int `yaml:"max_new_per_cycle"`
+	// Releases publishes release notes; ReleaseFiles also uploads the files the archive kept.
+	Releases     bool `yaml:"releases"`
+	ReleaseFiles bool `yaml:"release_files"`
+	// Snapshots pushes the history preserved from force pushes and deletions upstream as
+	// archived/<date>/<name> branches and tags.
+	Snapshots bool `yaml:"snapshots"`
+}
+
+// RepoURL is the public web address of a mirrored repository.
+func (m Mirror) RepoURL(path string) string {
+	if path == "" {
+		return ""
+	}
+	return m.PublicURL + "/" + path
+}
+
 type Forge struct {
 	Host  string `yaml:"host"`
 	Type  string `yaml:"type"` // github | gitea | gitlab
@@ -213,6 +249,7 @@ type Config struct {
 	HTTP               HTTP     `yaml:"http"`
 	Light              Light    `yaml:"light"`
 	Sources            []Source `yaml:"sources"`
+	Mirror             Mirror   `yaml:"mirror"`
 
 	CheckInterval time.Duration `yaml:"-"`
 	GitTimeout    time.Duration `yaml:"-"`
@@ -252,6 +289,13 @@ func defaults() *Config {
 			DownloadAssets:     true,
 			MaxAssetSizeRaw:    "2GB",
 			IncludePrereleases: true,
+		},
+		Mirror: Mirror{
+			Concurrency:    2,
+			MaxNewPerCycle: 50,
+			Releases:       true,
+			ReleaseFiles:   true,
+			Snapshots:      true,
 		},
 		Light: Light{
 			CheckIntervalRaw:  "12h",
@@ -421,6 +465,28 @@ func (c *Config) validate() error {
 			if s.AnnounceTemplate, err = template.New(s.Name).Funcs(TemplateFuncs).Parse(strings.TrimSpace(s.Announce)); err != nil {
 				add("sources[%d].announce: %v", i, err)
 			}
+		}
+	}
+
+	if mi := &c.Mirror; mi.Enabled {
+		mi.URL = strings.TrimRight(strings.TrimSpace(mi.URL), "/")
+		if u, err := url.Parse(mi.URL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			add("mirror.url must be an http:// or https:// URL")
+		}
+		mi.PublicURL = strings.TrimRight(strings.TrimSpace(mi.PublicURL), "/")
+		if mi.PublicURL == "" {
+			mi.PublicURL = mi.URL
+		} else if !strings.HasPrefix(mi.PublicURL, "http://") && !strings.HasPrefix(mi.PublicURL, "https://") {
+			add("mirror.public_url must start with http:// or https://")
+		}
+		if strings.TrimSpace(mi.Token) == "" {
+			add("mirror.token is required")
+		}
+		if mi.Concurrency < 1 {
+			mi.Concurrency = 1
+		}
+		if mi.MaxNewPerCycle < 0 {
+			add("mirror.max_new_per_cycle must be 0 (no cap) or more")
 		}
 	}
 

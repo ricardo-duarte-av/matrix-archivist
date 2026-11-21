@@ -31,6 +31,7 @@ The base command is set by `command_prefix` (default `!archivist`).
 | `!archivist refresh <#id\|url\|all>` | PL ≥ `min_power_level` | Check now and reply with what changed. |
 | `!archivist light <#id\|url>…` / `full …` | PL ≥ `min_power_level` | Switch repositories to [light or full mode](#light-mode-and-sources) and check them right away. |
 | `!archivist status` | everyone | Overall status: counts, storage, next summary. `status #id` is the same as `info`. |
+| `!archivist forge [sync <#id\|url\|all>]` | everyone (`sync`: PL ≥ `min_power_level`) | [Forge mirror](#forge-mirror) status and failures. `sync` publishes repositories again now (`all`: in the background). |
 | `!archivist usage` | everyone | Disk usage per repository, biggest first, and free space. |
 | `!archivist summary` | everyone | Post the summary of changes since the last scheduled summary. |
 | `!archivist export` | everyone | Upload the repository list, with notes and tags, as a JSON file. |
@@ -99,6 +100,31 @@ sources:
 - **Removing by hand:** `remove` on a repository a source added stops the source from adding it back. `add` it again to undo that.
 - **Links** to files inside a GitHub repository (`github.com/o/r/tree/…`, `raw.githubusercontent.com/o/r/…`) are reduced to the repository.
 - **Format:** a JSON array of objects (`url_field`, `tag_fields`, `note_fields` choose the fields) or of URL strings, or plain text with one URL per line.
+
+## Forge mirror
+
+The archive can be published to a Forgejo (or Gitea) instance, so every repository can be browsed, searched and cloned like on GitHub. The archive stays the authority: the forge is only a copy, overwritten from the archive, and nothing is ever fetched from it.
+
+```yaml
+mirror:
+  enabled: true
+  url: http://forgejo:3000            # same Docker network
+  public_url: https://git.example.org
+  token: "…"                          # of a dedicated account, e.g. "archivist"
+```
+
+What each repository gets on the forge:
+
+- **Name:** `github.com/zeldaret/oot` becomes `<forge>/zeldaret/oot`: one organization per upstream owner, created as needed. GitLab subgroups are joined (`group/sub-project`). If two hosts have the same owner and name, the second one gets the host appended (`oot-gitlab.com`).
+- **Git:** every branch and tag, force-pushed to match the archive. Branches and tags deleted upstream stay. History preserved from a force push upstream is pushed as `archived/<date>/<branch>` branches (and tags), so it can be browsed too (`snapshots: false` leaves it out).
+- **Releases:** every release in the archive, with its title and notes, plus a footer with where it comes from and when it was first published (the forge can't backdate releases). Files are uploaded for the releases that kept them: light repositories have notes for every release but files for the newest only, and when light mode drops the files of an older release, the forge drops them too.
+- **Page:** the note ("Super Mario 64 · N64") and description, the upstream URL as website, and the tags and upstream topics as topics, so the forge can be filtered by console or OS. Repositories that disappeared upstream get a `gone-upstream` (or `taken-down`) topic.
+- **Off:** issues, pull requests, wiki, projects, packages and Actions.
+- **Removed repositories** are archived (read-only) on the forge; `remove --purge` deletes them there too. Adding a repository back un-archives it.
+
+Syncing runs in the background after every check cycle, and after `add` and `refresh`. Repositories whose git, releases and page didn't change are skipped without asking the forge anything, so a pass over hundreds of repositories takes seconds. The first publication of an existing archive is spread out: at most `max_new_per_cycle` (50) new repositories per pass. A failing repository is retried after 1, 4, 9, 16, then every 24 hours; `forge` lists the failures and `forge sync #12` retries one right away. The live activity feed and the log show each pass.
+
+**Setting up Forgejo:** create an account for the archivist and a token with the scopes `write:organization`, `write:repository` and `read:user`. The account must be allowed to create organizations (the default). Release files are limited by Forgejo's `[attachment] MAX_SIZE` (2 GB by default); a file the forge refuses is reported as a warning and skipped. Use the forge only for the mirror: anything changed there by hand is overwritten.
 
 ## Storage layout
 
@@ -240,6 +266,7 @@ See [`config.example.yaml`](config.example.yaml); every option is commented ther
 | `releases.*` | Release archiving, asset downloads, per-asset size cap, prereleases, retention (`keep_last`, `max_repo_size`). |
 | `light.*` | Check interval, clones per cycle and release limits of [light repositories](#light-mode-and-sources). |
 | `sources` | Lists of repositories to archive automatically. |
+| `mirror.*` | Publish the archive to a [Forgejo/Gitea instance](#forge-mirror). |
 | `forges` | API tokens and self-hosted forges. A GitHub token is strongly recommended: without one the API allows 60 requests/hour. |
 | `prune_deleted` | Whether branches and tags deleted upstream are deleted from the archive too. Default `false`: they are kept. Either way they're snapshotted under `refs/archive/` first. |
 | `disk_warn_free` | @room alert when free space in `storage_dir` drops below this (default `5GB`). A notice follows when it recovers. |

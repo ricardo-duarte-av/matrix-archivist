@@ -170,6 +170,9 @@ func (b *Bot) cmdInfo(evt *event.Event, args []string) {
 	if u := b.cfg.HTTP.BrowseURL(r.RelDir); u != "" {
 		rows = append(rows, kv("Browse", linkCell(u, u)))
 	}
+	if b.arch.MirrorEnabled() {
+		rows = append(rows, kv("Forge", b.mirrorCell(r)))
+	}
 	if r.LastError != "" {
 		rows = append(rows, kv("Last error", cell{"<code>" + html.EscapeString(oneLineMD(r.LastError, 300)) + "</code>", oneLineMD(r.LastError, 300)}))
 	}

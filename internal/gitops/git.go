@@ -4,8 +4,11 @@ package gitops
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -112,17 +115,22 @@ func (g *Git) run(ctx context.Context, dir string, args ...string) (string, erro
 }
 
 func (g *Git) runInput(ctx context.Context, dir, stdin string, args ...string) (string, error) {
-	return g.exec(ctx, dir, stdin, nil, args...)
+	return g.exec(ctx, dir, stdin, nil, nil, args...)
 }
 
 // runProgress runs a clone/fetch with --progress and reports its progress to the live slot
 // attached to ctx (if any).
 func (g *Git) runProgress(ctx context.Context, dir string, args ...string) (string, error) {
+	return g.runProgressEnv(ctx, dir, nil, args...)
+}
+
+// runProgressEnv is runProgress with extra environment variables.
+func (g *Git) runProgressEnv(ctx context.Context, dir string, env []string, args ...string) (string, error) {
 	slot := live.From(ctx)
 	if slot == nil {
-		return g.exec(ctx, dir, "", nil, args...)
+		return g.exec(ctx, dir, "", env, nil, args...)
 	}
-	return g.exec(ctx, dir, "", func(line string) {
+	return g.exec(ctx, dir, "", env, func(line string) {
 		if p, ok := ParseProgress(line); ok {
 			slot.SetDetail(p.Text())
 			slot.Progress(p.Done, p.Total, "objects")
@@ -130,7 +138,7 @@ func (g *Git) runProgress(ctx context.Context, dir string, args ...string) (stri
 	}, args...)
 }
 
-func (g *Git) exec(ctx context.Context, dir, stdin string, onProgress func(string), args ...string) (string, error) {
+func (g *Git) exec(ctx context.Context, dir, stdin string, env []string, onProgress func(string), args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, g.Binary, args...)
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
@@ -147,6 +155,7 @@ func (g *Git) exec(ctx context.Context, dir, stdin string, onProgress func(strin
 		"GIT_SSH_COMMAND=ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new",
 		"LC_ALL=C",
 	)
+	cmd.Env = append(cmd.Env, env...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -242,6 +251,62 @@ func (g *Git) FetchMirror(ctx context.Context, dir string, prune bool) error {
 		}
 	}
 	return nil
+}
+
+// PushMirror pushes every branch and tag of the archive clone at dir to remoteURL, forcing
+// them to the archive's state; branches and tags missing from the archive are left alone on
+// the remote. With snapshots, refs preserved under refs/archive/<stamp>/{heads,tags}/<name>
+// are pushed too, as archived/<stamp>/<name> branches and tags. auth is sent as the
+// Authorization header (through the environment, so it doesn't show in the process list).
+func (g *Git) PushMirror(ctx context.Context, dir, remoteURL, auth string, snapshots bool) error {
+	out, err := g.run(ctx, dir, "for-each-ref", "--format=%(refname)", "refs/heads", "refs/tags", ArchiveNamespace)
+	if err != nil {
+		return err
+	}
+	var specs []string
+	var heads, tags bool
+	for _, ref := range strings.Split(strings.TrimSpace(out), "\n") {
+		switch {
+		case strings.HasPrefix(ref, "refs/heads/"):
+			heads = true
+		case strings.HasPrefix(ref, "refs/tags/"):
+			tags = true
+		case snapshots && strings.HasPrefix(ref, ArchiveNamespace):
+			parts := strings.SplitN(strings.TrimPrefix(ref, ArchiveNamespace), "/", 3)
+			if len(parts) == 3 && (parts[1] == "heads" || parts[1] == "tags") {
+				specs = append(specs, fmt.Sprintf("+%s:refs/%s/archived/%s/%s", ref, parts[1], parts[0], parts[2]))
+			}
+		}
+	}
+	if tags {
+		specs = append([]string{"+refs/tags/*:refs/tags/*"}, specs...)
+	}
+	if heads {
+		specs = append([]string{"+refs/heads/*:refs/heads/*"}, specs...)
+	}
+	if len(specs) == 0 {
+		return nil // empty repository: nothing to push
+	}
+	env := []string{
+		"GIT_CONFIG_COUNT=1",
+		"GIT_CONFIG_KEY_0=http.extraHeader",
+		"GIT_CONFIG_VALUE_0=Authorization: " + auth,
+	}
+	args := append([]string{"-c", "gc.auto=0", "push", "--progress", "--no-verify", "--", remoteURL}, specs...)
+	_, err = g.runProgressEnv(ctx, dir, env, args...)
+	return err
+}
+
+// RefsFingerprint hashes every branch, tag and preserved ref of a repository plus its HEAD, to
+// tell cheaply whether anything changed since a previous push.
+func (g *Git) RefsFingerprint(ctx context.Context, dir string) (string, error) {
+	out, err := g.run(ctx, dir, "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads", "refs/tags", ArchiveNamespace)
+	if err != nil {
+		return "", err
+	}
+	h := sha256.New()
+	io.WriteString(h, g.DefaultBranch(ctx, dir)+"\n"+out)
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // SnapshotRefs lists branches and tags of a repository.
