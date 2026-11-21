@@ -580,7 +580,7 @@ func (a *Archiver) archiveReleases(ctx context.Context, repo *store.Repo, u gito
 	planned := map[string]bool{}
 	for _, c := range a.planReleases(repo, pol, cands) {
 		planned[c.Tag] = true
-		if (!c.Archived || c.MetaOnly) && c.Release != nil {
+		if (!c.Archived || c.MetaOnly || c.Incomplete) && c.Release != nil {
 			todo = append(todo, job{c, true})
 		}
 	}

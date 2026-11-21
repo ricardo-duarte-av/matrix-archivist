@@ -153,6 +153,16 @@ forges: [{host: git.invalid, type: github, api_url: %q}]
 	if notes, files := state(); notes != "v1,v2,v3,v4,v5,v6" || files != "v6" {
 		t.Fatalf("light again: notes %s, files %s", notes, files)
 	}
+
+	// A file missing from disk although the release was archived with it is downloaded again.
+	os.Remove(filepath.Join(relDir, "v6", "assets", "a.bin"))
+	repo, _ = st.Repo(ctx, repo.ID)
+	if rr := a.archiveReleases(ctx, repo, u, zerolog.Nop()); fmt.Sprint(rr.Filled) != "[v6]" || len(rr.New) != 0 {
+		t.Fatalf("missing file: %+v", rr)
+	}
+	if _, files := state(); files != "v6" || downloads["v6"] != 2 {
+		t.Fatalf("missing file not restored: files %s, downloads %v", files, downloads)
+	}
 }
 
 func TestDueRepos(t *testing.T) {

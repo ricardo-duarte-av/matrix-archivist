@@ -19,9 +19,12 @@ type ReleaseCandidate struct {
 	Tag       string
 	Published time.Time
 	Archived  bool
-	MetaOnly  bool           // archived without its files (notes and metadata only)
-	Size      int64          // bytes on disk if archived with files, else the estimated download size
-	Release   *forge.Release // nil if the release no longer exists upstream
+	MetaOnly  bool // archived without its files (notes and metadata only)
+	// Incomplete is archived with its files, but some of them are missing from disk (deleted
+	// by hand or by a mistake); they are downloaded again.
+	Incomplete bool
+	Size       int64          // bytes on disk if archived with files, else the estimated download size
+	Release    *forge.Release // nil if the release no longer exists upstream
 }
 
 // releasePolicy is how a repository's releases are archived, depending on its mode.
@@ -97,6 +100,7 @@ func (a *Archiver) releaseCandidates(ctx context.Context, repo *store.Repo, pol 
 		if ar, ok := have[rel.Tag]; ok && !ar.MetaOnly {
 			c.Archived = true
 			c.Size = gitops.DirSize(a.releaseDir(repo, rel.Tag))
+			c.Incomplete = missingAssets(pol, rel, filepath.Join(a.releaseDir(repo, rel.Tag), "assets"))
 		} else {
 			c.Archived, c.MetaOnly = ok, ok
 			c.Size = estimateSize(pol, rel)
@@ -117,6 +121,27 @@ func (a *Archiver) releaseCandidates(ctx context.Context, repo *store.Repo, pol 
 
 func (a *Archiver) releaseDir(repo *store.Repo, tag string) string {
 	return filepath.Join(a.releasesDir(repo), forge.SafeName(tag))
+}
+
+// missingAssets reports whether a release archived with its files lacks some of them on disk
+// (files over the size limit are skipped on purpose and don't count).
+func missingAssets(pol releasePolicy, rel *forge.Release, dir string) bool {
+	if !pol.downloadAssets {
+		return false
+	}
+	for _, as := range rel.Assets {
+		if max := pol.maxAssetSize; max > 0 && as.Size > max {
+			continue
+		}
+		name := forge.SafeName(as.Name)
+		if name == "" {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			return true
+		}
+	}
+	return false
 }
 
 // estimateSize is the size of the assets that would be downloaded (as reported by the forge).

@@ -497,6 +497,10 @@ func (g *Git) SyncCheckout(ctx context.Context, mirrorDir, checkoutDir string) e
 		_, err := g.run(ctx, "", "clone", "--quiet", "--branch", branch, "--", absMirror, checkoutDir)
 		return err
 	}
+	// The checkout remembers the mirror's absolute path; follow it if the storage moved.
+	if _, err := g.run(ctx, checkoutDir, "remote", "set-url", "origin", absMirror); err != nil {
+		return err
+	}
 	if _, err := g.run(ctx, checkoutDir, "fetch", "--prune", "--quiet", "origin"); err != nil {
 		return err
 	}

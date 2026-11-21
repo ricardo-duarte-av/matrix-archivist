@@ -249,3 +249,37 @@ func TestProgress(t *testing.T) {
 		t.Errorf("progress %q, rest %q", got, rest.String())
 	}
 }
+
+// A checkout keeps working after the storage directory is moved (its origin is the mirror's
+// absolute path).
+func TestCheckoutAfterStorageMove(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	upstream := filepath.Join(tmp, "upstream")
+	os.MkdirAll(upstream, 0o755)
+	run(t, upstream, "init", "-q", "-b", "main")
+	commit(t, upstream, "a")
+	g := New()
+	g.AllowLocalRemotes = true
+	old := filepath.Join(tmp, "old")
+	if err := g.CloneMirror(ctx, upstream, filepath.Join(old, "mirror.git")); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.SyncCheckout(ctx, filepath.Join(old, "mirror.git"), filepath.Join(old, "checkout")); err != nil {
+		t.Fatal(err)
+	}
+	moved := filepath.Join(tmp, "moved")
+	if err := os.Rename(old, moved); err != nil {
+		t.Fatal(err)
+	}
+	commit(t, upstream, "b")
+	if err := g.FetchMirror(ctx, filepath.Join(moved, "mirror.git"), false); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.SyncCheckout(ctx, filepath.Join(moved, "mirror.git"), filepath.Join(moved, "checkout")); err != nil {
+		t.Fatalf("checkout after move: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(moved, "checkout", "b")); err != nil {
+		t.Fatal("checkout not updated after move")
+	}
+}
