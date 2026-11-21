@@ -103,3 +103,19 @@ func Topics(tags []string) []string {
 	}
 	return out
 }
+
+// CleanText makes text safe for the forge's database: invalid UTF-8 is dropped, and so are
+// NUL bytes and other control characters except tab and line breaks (PostgreSQL refuses NUL
+// in text, and upstream release notes sometimes contain one).
+func CleanText(s string) string {
+	s = strings.ToValidUTF8(s, "")
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r == '\t' || r == '\n' || r == '\r':
+			return r
+		case r < 0x20 || r == 0x7f:
+			return -1
+		}
+		return r
+	}, s)
+}

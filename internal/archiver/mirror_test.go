@@ -555,6 +555,9 @@ func TestMirrorNames(t *testing.T) {
 	if got := mirror.WithSuffix("oot", "gitlab.com"); got != "oot-gitlab.com" {
 		t.Errorf("suffix: %s", got)
 	}
+	if got := mirror.CleanText("Press \x00M\x00 to\r\n\ttoggle\xff ✓"); got != "Press M to\r\n\ttoggle ✓" {
+		t.Errorf("CleanText: %q", got)
+	}
 	title, body := parseNotes("# My release\n\nTag: `v1`  \nPublished: 2026-01-01T00:00:00Z\n\nLine one\n\nLine two\n")
 	if title != "My release" || body != "Line one\n\nLine two" {
 		t.Errorf("parseNotes: %q %q", title, body)

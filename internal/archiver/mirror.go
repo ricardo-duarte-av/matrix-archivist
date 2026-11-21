@@ -451,7 +451,7 @@ func (a *Archiver) mirrorMeta(ctx context.Context, repo *store.Repo, owner, name
 	if m.Description == "" {
 		m.Description = "Archive of " + m.Website
 	}
-	m.Description = truncateRunes(m.Description, 255)
+	m.Description = truncateRunes(mirror.CleanText(m.Description), 255)
 	topics := append(append([]string{}, repo.Tags...), repo.Topics...)
 	switch repo.Upstream {
 	case store.UpstreamGone:
@@ -675,7 +675,7 @@ func (a *Archiver) syncForgeReleases(ctx context.Context, repo *store.Repo, owne
 			continue
 		}
 		slot.SetStep("Syncing releases to forge", fmt.Sprintf("%s (%d/%d)", l.Tag, i+1, len(local)))
-		opts := mirror.ReleaseOptions{Tag: l.Tag, Name: l.Title, Body: releaseBody(repo, l, withFiles), Prerelease: l.Prerelease}
+		opts := mirror.ReleaseOptions{Tag: l.Tag, Name: mirror.CleanText(l.Title), Body: mirror.CleanText(releaseBody(repo, l, withFiles)), Prerelease: l.Prerelease}
 		r, ok := byTag[l.Tag]
 		delete(byTag, l.Tag)
 		switch {
