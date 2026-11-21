@@ -55,6 +55,9 @@ func main() {
 		log.Fatal().Err(err).Msg("Failed to create storage dir")
 	}
 
+	if err := archiver.CheckDatabase(cfg.Database, cfg.StorageDir); err != nil {
+		log.Fatal().Err(err).Msg("Refusing to start with a new database")
+	}
 	st, err := store.Open(cfg.Database)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to open database")
