@@ -122,6 +122,24 @@ What each repository gets on the forge:
 - **Off:** issues, pull requests, wiki, projects, packages and Actions.
 - **Removed repositories** are archived (read-only) on the forge; `remove --purge` deletes them there too. Adding a repository back un-archives it.
 
+**Storing release files once:** with `attachments_dir` set, each release file in the archive is replaced by a hardlink to the forge's copy after it is uploaded (the two are compared first, and the swap is atomic), so Forgejo and the archive share one copy on disk. Hardlinks need both directories on the same filesystem and, inside the archivist's container, under the same mount: two separate bind mounts of one disk can't hardlink across. Mount their common parent once, for example:
+
+```yaml
+# docker-compose.yaml
+    volumes:
+      - /share:/share          # instead of /share/archivist:/data
+```
+```yaml
+# config.yaml
+storage_dir: /share/archivist/repos
+database: /share/archivist/archivist.db
+crypto_database: /share/archivist/crypto.db
+mirror:
+  attachments_dir: /share/forgejo/gitea/attachments   # Forgejo's [attachment] PATH
+```
+
+Forgejo must keep its attachments on local disk (the default; not in object storage), and both containers must write files as the same user. Files already uploaded are linked by `forge sync all`. Deleting a file on one side (light mode dropping old release files, or the forge removing them) only removes that side's name; the data goes once neither uses it. `usage` and repository sizes still count linked files in full.
+
 Syncing runs in the background after every check cycle, and after `add` and `refresh`. Repositories whose git, releases and page didn't change are skipped without asking the forge anything, so a pass over hundreds of repositories takes seconds. The first publication of an existing archive is spread out: at most `max_new_per_cycle` (50) new repositories per pass. A failing repository is retried after 1, 4, 9, 16, then every 24 hours; `forge` lists the failures and `forge sync #12` retries one right away. The live activity feed and the log show each pass.
 
 **Setting up Forgejo:** create an account for the archivist and a token with the scopes `write:organization`, `write:repository` and `read:user`. The account must be allowed to create organizations (the default). Release files are limited by Forgejo's `[attachment] MAX_SIZE` (2 GB by default); a file the forge refuses is reported as a warning and skipped. Use the forge only for the mirror: anything changed there by hand is overwritten.

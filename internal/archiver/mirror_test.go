@@ -41,6 +41,8 @@ type fakeForge struct {
 	failNext map[string]int // path prefix → status to answer once
 	// emptyGETs is EmptyGETs of new repositories.
 	emptyGETs int
+	// attachDir stores uploaded files the way Forgejo does: <dir>/<u[0]>/<u[1]>/<uuid>.
+	attachDir string
 }
 
 type fakeRepo struct {
@@ -58,7 +60,7 @@ type fakeRepo struct {
 }
 
 func newFakeForge(t *testing.T) (*fakeForge, *httptest.Server) {
-	f := &fakeForge{t: t, root: t.TempDir(), token: "secret", orgs: map[string]bool{}, repos: map[string]*fakeRepo{}, failNext: map[string]int{}}
+	f := &fakeForge{t: t, root: t.TempDir(), attachDir: t.TempDir(), token: "secret", orgs: map[string]bool{}, repos: map[string]*fakeRepo{}, failNext: map[string]int{}}
 	backend, err := exec.Command("git", "--exec-path").Output()
 	if err != nil {
 		t.Skip("git not available")
@@ -240,9 +242,13 @@ func (f *fakeForge) repoAPI(w http.ResponseWriter, r *http.Request, repo *fakeRe
 		data, _ := io.ReadAll(file)
 		f.nextID++
 		repo.Files[f.nextID] = data
-		rel.Assets = append(rel.Assets, mirror.Attachment{ID: f.nextID, Name: r.URL.Query().Get("name"), Size: int64(len(data))})
+		uuid := fmt.Sprintf("ab%030d", f.nextID)
+		os.MkdirAll(filepath.Join(f.attachDir, "a", "b"), 0o755)
+		os.WriteFile(filepath.Join(f.attachDir, "a", "b", uuid), data, 0o644)
+		att := mirror.Attachment{ID: f.nextID, Name: r.URL.Query().Get("name"), Size: int64(len(data)), UUID: uuid}
+		rel.Assets = append(rel.Assets, att)
 		w.WriteHeader(201)
-		reply(map[string]any{})
+		reply(att)
 	case len(seg) == 4 && seg[0] == "releases" && seg[2] == "assets" && r.Method == "DELETE":
 		rel := release(seg[1])
 		id, _ := strconv.ParseInt(seg[3], 10, 64)
@@ -324,8 +330,8 @@ func TestMirrorSync(t *testing.T) {
 	st := testStore(t)
 	cfg, err := config.Parse([]byte(fmt.Sprintf(testMatrix+`
 storage_dir: %s
-mirror: {enabled: true, url: %q, public_url: "https://git.example.org/", token: secret, max_new_per_cycle: 1}
-`, filepath.Join(tmp, "repos"), srv.URL)))
+mirror: {enabled: true, url: %q, public_url: "https://git.example.org/", token: secret, max_new_per_cycle: 1, attachments_dir: %q}
+`, filepath.Join(tmp, "repos"), srv.URL, forge.attachDir)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -396,6 +402,42 @@ mirror: {enabled: true, url: %q, public_url: "https://git.example.org/", token: 
 	if got := forge.releases(key); got != "v1[](notes only) v2[game.zip:7]" {
 		t.Errorf("forge releases: %s", got)
 	}
+	// The archived file is now the forge's file (one copy on disk).
+	zip := filepath.Join(a.releaseDir(repo, "v2"), "assets", "game.zip")
+	forgeFile := func(tag string) string {
+		for _, r := range forge.repos[key].Releases {
+			if r.Tag == tag {
+				return filepath.Join(forge.attachDir, "a", "b", r.Assets[0].UUID)
+			}
+		}
+		return ""
+	}
+	sameFile := func(x, y string) bool {
+		sx, err1 := os.Stat(x)
+		sy, err2 := os.Stat(y)
+		return err1 == nil && err2 == nil && os.SameFile(sx, sy)
+	}
+	if !sameFile(zip, forgeFile("v2")) {
+		t.Error("archived release file not hardlinked to the forge's copy")
+	}
+	if b, _ := os.ReadFile(zip); string(b) != "zipdata" {
+		t.Errorf("archived file content: %q", b)
+	}
+	// A file uploaded before hardlinking was enabled is linked by a forced sync.
+	os.Remove(zip)
+	os.WriteFile(zip, []byte("zipdata"), 0o644)
+	if res := a.SyncMirror(ctx, repo.ID, true); res.Err != nil || res.Linked != 1 || res.Freed != 7 || !sameFile(zip, forgeFile("v2")) {
+		t.Fatalf("relink: %+v", res)
+	}
+	// A forge file with other content is never linked.
+	os.WriteFile(forgeFile("v2"), []byte("tampere"), 0o644)
+	os.Remove(zip)
+	os.WriteFile(zip, []byte("zipdata"), 0o644)
+	if res := a.SyncMirror(ctx, repo.ID, true); res.Linked != 0 || len(res.Warnings) != 1 || sameFile(zip, forgeFile("v2")) {
+		t.Fatalf("mismatching forge file: %+v", res)
+	}
+	os.WriteFile(forgeFile("v2"), []byte("zipdata"), 0o644)
+
 	if b := forge.repos[key].Releases[0].Body; !strings.HasPrefix(b, "Changes in v1.") || !strings.Contains(b, "originally published 2026-01-01") {
 		t.Errorf("release body: %q", b)
 	}

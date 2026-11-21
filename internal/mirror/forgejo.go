@@ -257,6 +257,8 @@ type Attachment struct {
 	ID   int64  `json:"id"`
 	Name string `json:"name"`
 	Size int64  `json:"size"`
+	// UUID names the file in Forgejo's attachment storage: <attachments>/<u[0]>/<u[1]>/<uuid>.
+	UUID string `json:"uuid"`
 }
 
 // Releases lists every release of a repository.
@@ -310,10 +312,10 @@ func (c *Client) DeleteAttachment(ctx context.Context, owner, name string, relea
 }
 
 // UploadAttachment uploads a local file to a release under the given name, streaming it.
-func (c *Client) UploadAttachment(ctx context.Context, owner, name string, releaseID int64, fileName, path string) error {
+func (c *Client) UploadAttachment(ctx context.Context, owner, name string, releaseID int64, fileName, path string) (*Attachment, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer f.Close()
 	pr, pw := io.Pipe()
@@ -332,10 +334,14 @@ func (c *Client) UploadAttachment(ctx context.Context, owner, name string, relea
 	req, err := http.NewRequestWithContext(ctx, "POST", c.Base+"/api/v1"+p, pr)
 	if err != nil {
 		pr.Close()
-		return err
+		return nil, err
 	}
 	req.Header.Set("Content-Type", mw.FormDataContentType())
-	err = c.send(req, "POST", p, nil)
+	var att Attachment
+	err = c.send(req, "POST", p, &att)
 	pr.Close()
-	return err
+	if err != nil {
+		return nil, err
+	}
+	return &att, nil
 }

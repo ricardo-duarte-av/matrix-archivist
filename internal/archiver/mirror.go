@@ -1,18 +1,21 @@
 package archiver
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -71,12 +74,15 @@ func (a *Archiver) runMirror(ctx context.Context) {
 
 // MirrorResult is what one repository's sync to the forge did.
 type MirrorResult struct {
-	Repo      *store.Repo
-	Path      string // owner/name on the forge
-	Created   bool   // the forge repository was created in this sync
-	Pushed    bool
-	Releases  int // releases created, edited or deleted on the forge
-	Files     int // files uploaded or deleted
+	Repo     *store.Repo
+	Path     string // owner/name on the forge
+	Created  bool   // the forge repository was created in this sync
+	Pushed   bool
+	Releases int // releases created, edited or deleted on the forge
+	Files    int // files uploaded or deleted
+	// Linked archive files were replaced by hardlinks to the forge's copy, freeing Freed bytes.
+	Linked    int
+	Freed     int64
 	Unchanged bool
 	Busy      bool // the repository was being checked; try again later
 	Warnings  []string
@@ -105,6 +111,9 @@ func (r MirrorResult) Text() string {
 	if r.Files > 0 {
 		parts = append(parts, fmt.Sprintf("%d %s synced", r.Files, plural(r.Files, "file", "files")))
 	}
+	if r.Linked > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s shared with the forge (%s freed)", r.Linked, plural(r.Linked, "file", "files"), gitops.HumanSize(r.Freed)))
+	}
 	if len(parts) == 0 {
 		parts = append(parts, "settings updated")
 	}
@@ -119,6 +128,8 @@ func (r MirrorResult) Text() string {
 type MirrorPassResult struct {
 	Ran                              bool
 	Created, Updated, Failed, Queued int
+	Linked                           int   // archive files replaced by hardlinks to the forge's copy
+	Freed                            int64 // bytes freed by those hardlinks
 }
 
 // mirrorBackoff is how long to wait before retrying a repository that failed n times in a row.
@@ -184,6 +195,8 @@ func (a *Archiver) MirrorPass(ctx context.Context) (out MirrorPassResult) {
 			for id := range jobs {
 				res := a.syncMirror(ctx, id, false)
 				mu.Lock()
+				out.Linked += res.Linked
+				out.Freed += res.Freed
 				switch {
 				case res.Err != nil:
 					out.Failed++
@@ -213,9 +226,13 @@ feed:
 		if queued > 0 {
 			text += fmt.Sprintf(", %d waiting for the next pass", queued)
 		}
+		if out.Linked > 0 {
+			text += fmt.Sprintf("; %d release files shared with the forge, %s freed", out.Linked, gitops.HumanSize(out.Freed))
+		}
 		a.Live.Event(0, "", "mirror", text)
 		a.log.Info().Int("published", out.Created).Int("updated", out.Updated).Int("failed", out.Failed).
-			Int("queued", queued).Dur("took", time.Since(start)).Msg("Forge sync finished")
+			Int("queued", queued).Int("linked", out.Linked).Int64("freed_bytes", out.Freed).
+			Dur("took", time.Since(start)).Msg("Forge sync finished")
 	}
 	return out
 }
@@ -352,8 +369,8 @@ func (a *Archiver) syncMirror(ctx context.Context, id int64, wait bool) (res Mir
 			return fail(err)
 		}
 		if ready {
-			n, files, warnings, err := a.syncForgeReleases(ctx, repo, owner, name, rels, refs)
-			res.Releases, res.Files, res.Warnings = n, files, warnings
+			rs, err := a.syncForgeReleases(ctx, repo, owner, name, rels, refs)
+			res.Releases, res.Files, res.Linked, res.Freed, res.Warnings = rs.changed, rs.files, rs.linked, rs.freed, rs.warnings
 			if err != nil {
 				return fail(err)
 			}
@@ -636,12 +653,12 @@ func releaseBody(repo *store.Repo, l localRelease, files bool) string {
 // syncForgeReleases makes the forge's releases match the archive: missing ones are created,
 // changed ones edited, files uploaded or removed, and releases the archive no longer has
 // deleted (their tags stay). Releases whose tag isn't in the archive are left out.
-func (a *Archiver) syncForgeReleases(ctx context.Context, repo *store.Repo, owner, name string, local []localRelease, refs gitops.Refs) (changed, files int, warnings []string, err error) {
+func (a *Archiver) syncForgeReleases(ctx context.Context, repo *store.Repo, owner, name string, local []localRelease, refs gitops.Refs) (out releaseSync, err error) {
 	slot := live.From(ctx)
 	slot.SetStep("Syncing releases to forge", "")
 	remote, err := a.mirror.Releases(ctx, owner, name)
 	if err != nil {
-		return 0, 0, nil, err
+		return out, err
 	}
 	byTag := map[string]mirror.Release{}
 	for _, r := range remote {
@@ -651,7 +668,7 @@ func (a *Archiver) syncForgeReleases(ctx context.Context, repo *store.Repo, owne
 	missingTags := 0
 	for i, l := range local {
 		if ctx.Err() != nil {
-			return changed, files, warnings, ctx.Err()
+			return out, ctx.Err()
 		}
 		if _, ok := refs["refs/tags/"+l.Tag]; !ok {
 			missingTags++
@@ -665,15 +682,15 @@ func (a *Archiver) syncForgeReleases(ctx context.Context, repo *store.Repo, owne
 		case !ok:
 			created, err := a.createForgeRelease(ctx, owner, name, opts)
 			if err != nil {
-				return changed, files, warnings, fmt.Errorf("release %s: %w", l.Tag, err)
+				return out, fmt.Errorf("release %s: %w", l.Tag, err)
 			}
 			r = *created
-			changed++
+			out.changed++
 		case r.Name != opts.Name || strings.TrimSpace(r.Body) != strings.TrimSpace(opts.Body) || r.Prerelease != opts.Prerelease || r.Draft:
 			if err := a.mirror.EditRelease(ctx, owner, name, r.ID, opts); err != nil {
-				return changed, files, warnings, fmt.Errorf("release %s: %w", l.Tag, err)
+				return out, fmt.Errorf("release %s: %w", l.Tag, err)
 			}
-			changed++
+			out.changed++
 		}
 		if !withFiles {
 			continue
@@ -686,41 +703,129 @@ func (a *Archiver) syncForgeReleases(ctx context.Context, repo *store.Repo, owne
 		for _, att := range r.Assets {
 			if f, ok := want[att.Name]; ok && f.Size == att.Size && !have[att.Name] {
 				have[att.Name] = true
+				out.link(a, f, att)
 				continue
 			}
 			if err := a.mirror.DeleteAttachment(ctx, owner, name, r.ID, att.ID); err != nil {
-				return changed, files, warnings, fmt.Errorf("release %s: deleting %s: %w", l.Tag, att.Name, err)
+				return out, fmt.Errorf("release %s: deleting %s: %w", l.Tag, att.Name, err)
 			}
-			files++
+			out.files++
 		}
 		for j, f := range l.Files {
 			if have[f.Name] {
 				continue
 			}
 			slot.SetStep("Uploading release file to forge", fmt.Sprintf("%s · %d/%d: %s (%s)", l.Tag, j+1, len(l.Files), f.Name, gitops.HumanSize(f.Size)))
-			if err := a.mirror.UploadAttachment(ctx, owner, name, r.ID, f.Name, f.Path); err != nil {
+			att, err := a.mirror.UploadAttachment(ctx, owner, name, r.ID, f.Name, f.Path)
+			if err != nil {
 				var apiErr *mirror.APIError
 				if errors.As(err, &apiErr) && apiErr.Status < 500 {
 					// Refused by the forge (too large, type not allowed): later syncs won't
 					// change that, so it's a warning rather than a failure.
-					warnings = append(warnings, fmt.Sprintf("release %s: %s refused: %s", l.Tag, f.Name, oneLine(apiErr.Message)))
+					out.warnings = append(out.warnings, fmt.Sprintf("release %s: %s refused: %s", l.Tag, f.Name, oneLine(apiErr.Message)))
 					continue
 				}
-				return changed, files, warnings, fmt.Errorf("release %s: uploading %s: %w", l.Tag, f.Name, err)
+				return out, fmt.Errorf("release %s: uploading %s: %w", l.Tag, f.Name, err)
 			}
-			files++
+			out.files++
+			out.link(a, f, *att)
 		}
 	}
 	for _, r := range byTag {
 		if err := a.mirror.DeleteRelease(ctx, owner, name, r.ID); err != nil {
-			return changed, files, warnings, fmt.Errorf("deleting release %s: %w", r.Tag, err)
+			return out, fmt.Errorf("deleting release %s: %w", r.Tag, err)
 		}
-		changed++
+		out.changed++
 	}
 	if missingTags > 0 {
 		a.log.Debug().Int64("repo_id", repo.ID).Int("releases", missingTags).Msg("Releases without their tag in the archive were not published")
 	}
-	return changed, files, warnings, nil
+	return out, nil
+}
+
+// releaseSync is what syncForgeReleases did.
+type releaseSync struct {
+	changed, files, linked int
+	freed                  int64
+	warnings               []string
+}
+
+// link replaces an archived release file with a hardlink to the forge's copy, if
+// mirror.attachments_dir is set (see linkAttachment).
+func (o *releaseSync) link(a *Archiver, f localFile, att mirror.Attachment) {
+	if a.cfg.Mirror.AttachmentsDir == "" {
+		return
+	}
+	freed, err := a.linkAttachment(f.Path, att)
+	switch {
+	case err != nil:
+		o.warnings = append(o.warnings, fmt.Sprintf("sharing %s with the forge: %s", f.Name, oneLine(err.Error())))
+	case freed > 0:
+		o.linked++
+		o.freed += freed
+	}
+}
+
+// linkAttachment makes the archive's file at path a hardlink to the forge's stored copy of
+// att, so the file is kept once on disk. It checks that both are the same file first and
+// swaps atomically. Returns the bytes freed (0 if they were already linked).
+func (a *Archiver) linkAttachment(path string, att mirror.Attachment) (int64, error) {
+	u := att.UUID
+	if len(u) < 3 || strings.ContainsAny(u, "/\\.") {
+		return 0, fmt.Errorf("the forge gave no usable file id (%q)", u)
+	}
+	src := filepath.Join(a.cfg.Mirror.AttachmentsDir, u[0:1], u[1:2], u)
+	sst, err := os.Stat(src)
+	if err != nil {
+		return 0, fmt.Errorf("forge file not found (is mirror.attachments_dir right?): %w", err)
+	}
+	dst, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	if os.SameFile(sst, dst) {
+		return 0, nil
+	}
+	if sst.Size() != dst.Size() || !sameEnds(src, path, sst.Size()) {
+		return 0, errors.New("the forge's copy differs from the archive's")
+	}
+	tmp := path + ".link"
+	_ = os.Remove(tmp)
+	if err := os.Link(src, tmp); err != nil {
+		if errors.Is(err, syscall.EXDEV) {
+			err = errors.New("storage_dir and mirror.attachments_dir are on different mounts; mount their common parent once")
+		}
+		return 0, err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return 0, err
+	}
+	return dst.Size(), nil
+}
+
+// sameEnds compares the first and last 64 KiB of two files of the given size.
+func sameEnds(a, b string, size int64) bool {
+	const n = 64 << 10
+	read := func(p string, off int64) []byte {
+		f, err := os.Open(p)
+		if err != nil {
+			return nil
+		}
+		defer f.Close()
+		buf := make([]byte, min(n, size))
+		if _, err := f.ReadAt(buf, off); err != nil && !errors.Is(err, io.EOF) {
+			return nil
+		}
+		return buf
+	}
+	for _, off := range []int64{0, max(0, size-n)} {
+		x, y := read(a, off), read(b, off)
+		if x == nil || y == nil || !bytes.Equal(x, y) {
+			return false
+		}
+	}
+	return true
 }
 
 // createForgeRelease creates a release, retrying server errors for a while: right after a

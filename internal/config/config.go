@@ -159,6 +159,11 @@ type Mirror struct {
 	// Snapshots pushes the history preserved from force pushes and deletions upstream as
 	// archived/<date>/<name> branches and tags.
 	Snapshots bool `yaml:"snapshots"`
+	// AttachmentsDir is where the archiver sees Forgejo's attachment storage ([attachment]
+	// PATH). When set, release files in the archive are replaced by hardlinks to the files
+	// uploaded to the forge, so each is stored once. It must be on the same mount as
+	// storage_dir inside the container (mount their common parent once).
+	AttachmentsDir string `yaml:"attachments_dir"`
 }
 
 // RepoURL is the public web address of a mirrored repository.
@@ -484,6 +489,10 @@ func (c *Config) validate() error {
 		}
 		if mi.Concurrency < 1 {
 			mi.Concurrency = 1
+		}
+		mi.AttachmentsDir = strings.TrimRight(strings.TrimSpace(mi.AttachmentsDir), "/")
+		if mi.AttachmentsDir != "" && !strings.HasPrefix(mi.AttachmentsDir, "/") {
+			add("mirror.attachments_dir must be an absolute path")
 		}
 		if mi.MaxNewPerCycle < 0 {
 			add("mirror.max_new_per_cycle must be 0 (no cap) or more")

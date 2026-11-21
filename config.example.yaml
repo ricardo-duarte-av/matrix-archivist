@@ -142,6 +142,11 @@ mirror:
   releases: true                          # publish release notes
   release_files: true                     # and upload the release files the archive kept
   snapshots: true                         # push the history preserved from force pushes and deletions
+  # Keep each release file once on disk: after uploading, replace the archive's copy with a
+  # hardlink to the forge's ([attachment] PATH as seen in this container). Both must be under
+  # ONE mount in the container (mount their common parent, e.g. /share:/share): two separate
+  # mounts of the same disk can't hardlink. Run `forge sync all` once to link existing files.
+  attachments_dir: ""                     # e.g. /share/forgejo/gitea/attachments
 
 # Release APIs. github.com, gitlab.com, codeberg.org and a few other well-known hosts are detected
 # automatically, and unknown hosts are probed for a Gitea/Forgejo or GitLab API.
