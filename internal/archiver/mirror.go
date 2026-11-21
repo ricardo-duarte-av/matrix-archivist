@@ -347,10 +347,18 @@ func (a *Archiver) syncMirror(ctx context.Context, id int64, wait bool) (res Mir
 		if err != nil {
 			return fail(err)
 		}
-		n, files, warnings, err := a.syncForgeReleases(ctx, repo, owner, name, rels, refs)
-		res.Releases, res.Files, res.Warnings = n, files, warnings
+		ready, err := a.waitForgeNotEmpty(ctx, owner, name, refs)
 		if err != nil {
 			return fail(err)
+		}
+		if ready {
+			n, files, warnings, err := a.syncForgeReleases(ctx, repo, owner, name, rels, refs)
+			res.Releases, res.Files, res.Warnings = n, files, warnings
+			if err != nil {
+				return fail(err)
+			}
+		} else if len(rels) > 0 {
+			res.Warnings = append(res.Warnings, "releases not published: the archive has no branches, and the forge takes no releases in an empty repository")
 		}
 		st.ReleasesHash = relHash
 	}
@@ -459,7 +467,7 @@ func (a *Archiver) ensureForgeRepo(ctx context.Context, owner, name string, m fo
 	r, err := a.mirror.GetRepo(ctx, owner, name)
 	switch {
 	case errors.Is(err, mirror.ErrNotFound):
-		if err := a.mirror.CreateRepo(ctx, owner, name, m.Description, a.cfg.Mirror.Private); err != nil {
+		if err := a.mirror.CreateRepo(ctx, owner, name, m.Description, m.DefaultBranch, a.cfg.Mirror.Private); err != nil {
 			return false, fmt.Errorf("creating repository: %w", err)
 		}
 		return true, nil
@@ -479,6 +487,42 @@ func (a *Archiver) applyForgeMeta(ctx context.Context, owner, name string, m for
 		return err
 	}
 	return a.mirror.SetTopics(ctx, owner, name, m.Topics)
+}
+
+// waitForgeNotEmpty waits until the forge has processed the push and no longer considers the
+// repository empty (it refuses releases until then; Forgejo handles pushes in a background
+// queue, so this can take a moment after the first push). ready is false if the archive has
+// no branches, so the repository stays empty on the forge.
+func (a *Archiver) waitForgeNotEmpty(ctx context.Context, owner, name string, refs gitops.Refs) (ready bool, err error) {
+	hasBranch := false
+	for ref := range refs {
+		if strings.HasPrefix(ref, "refs/heads/") {
+			hasBranch = true
+			break
+		}
+	}
+	deadline := time.Now().Add(a.mirrorEmptyWait)
+	for {
+		r, err := a.mirror.GetRepo(ctx, owner, name)
+		if err != nil {
+			return false, err
+		}
+		if !r.Empty {
+			return true, nil
+		}
+		if !hasBranch {
+			return false, nil
+		}
+		if time.Now().After(deadline) {
+			return false, errors.New("the forge still shows the repository as empty after the push (it may still be processing it); will retry")
+		}
+		live.From(ctx).SetStep("Waiting for the forge to process the push", "")
+		select {
+		case <-time.After(a.mirrorEmptyPoll):
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	}
 }
 
 // localRelease is an archived release as it is published on the forge.

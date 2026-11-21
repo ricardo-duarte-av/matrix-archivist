@@ -54,6 +54,8 @@ type Archiver struct {
 	mirrorKick    chan struct{}
 	mirrorReady   atomic.Bool // the forge accepted the token
 	mirrorRunning atomic.Bool
+	// How long and how often to wait for the forge to process a push (see waitForgeNotEmpty).
+	mirrorEmptyWait, mirrorEmptyPoll time.Duration
 
 	// Counters exposed as metrics.
 	checksOK, checksFailed atomic.Int64
@@ -83,6 +85,7 @@ func New(cfg *config.Config, st *store.Store, log zerolog.Logger) *Archiver {
 	if cfg.Mirror.Enabled {
 		a.mirror = mirror.NewClient(cfg.Mirror.URL, cfg.Mirror.Token)
 		a.mirrorKick = make(chan struct{}, 1)
+		a.mirrorEmptyWait, a.mirrorEmptyPoll = 3*time.Minute, 2*time.Second
 	}
 	return a
 }

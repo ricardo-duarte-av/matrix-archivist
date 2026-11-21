@@ -39,9 +39,14 @@ type fakeForge struct {
 	calls    []string
 	gitAuth  []string
 	failNext map[string]int // path prefix → status to answer once
+	// emptyGETs is EmptyGETs of new repositories.
+	emptyGETs int
 }
 
 type fakeRepo struct {
+	// EmptyGETs is how many more GETs report the repository empty after it has branches
+	// (Forgejo processes pushes in the background).
+	EmptyGETs     int
 	Archived      bool
 	Description   string
 	Website       string
@@ -120,7 +125,10 @@ func (f *fakeForge) api(w http.ResponseWriter, r *http.Request, p string) {
 		if err := exec.Command("git", "init", "-q", "--bare", filepath.Join(f.root, key+".git")).Run(); err != nil {
 			f.t.Fatal(err)
 		}
-		f.repos[key] = &fakeRepo{Description: body["description"].(string), Files: map[int64][]byte{}}
+		f.repos[key] = &fakeRepo{Description: body["description"].(string), Files: map[int64][]byte{}, EmptyGETs: f.emptyGETs}
+		if b, ok := body["default_branch"].(string); ok {
+			f.repos[key].DefaultBranch = b
+		}
 		w.WriteHeader(201)
 		reply(map[string]any{})
 	case seg[0] == "repos" && len(seg) >= 3:
@@ -136,6 +144,10 @@ func (f *fakeForge) api(w http.ResponseWriter, r *http.Request, p string) {
 }
 
 func (f *fakeForge) repoAPI(w http.ResponseWriter, r *http.Request, repo *fakeRepo, key string, seg []string, body map[string]any, reply func(any)) {
+	empty := func() bool {
+		out, _ := exec.Command("git", "-C", filepath.Join(f.root, key+".git"), "for-each-ref", "refs/heads").Output()
+		return len(out) == 0
+	}
 	release := func(id string) *mirror.Release {
 		n, _ := strconv.ParseInt(id, 10, 64)
 		for _, rel := range repo.Releases {
@@ -147,7 +159,12 @@ func (f *fakeForge) repoAPI(w http.ResponseWriter, r *http.Request, repo *fakeRe
 	}
 	switch {
 	case len(seg) == 0 && r.Method == "GET":
-		reply(map[string]any{"archived": repo.Archived, "default_branch": repo.DefaultBranch})
+		isEmpty := empty()
+		if !isEmpty && repo.EmptyGETs > 0 {
+			repo.EmptyGETs--
+			isEmpty = true
+		}
+		reply(map[string]any{"archived": repo.Archived, "empty": isEmpty, "default_branch": repo.DefaultBranch})
 	case len(seg) == 0 && r.Method == "DELETE":
 		delete(f.repos, key)
 		os.RemoveAll(filepath.Join(f.root, key+".git"))
@@ -189,6 +206,10 @@ func (f *fakeForge) repoAPI(w http.ResponseWriter, r *http.Request, repo *fakeRe
 	case len(seg) == 1 && seg[0] == "releases" && r.Method == "POST":
 		if repo.Archived {
 			http.Error(w, `{"message":"archived"}`, 422)
+			return
+		}
+		if empty() || repo.EmptyGETs > 0 {
+			http.Error(w, `{"message":"repo is empty"}`, 422)
 			return
 		}
 		f.nextID++
@@ -314,6 +335,8 @@ mirror: {enabled: true, url: %q, public_url: "https://git.example.org/", token: 
 		t.Fatal(err)
 	}
 	a.mirrorReady.Store(true)
+	a.mirrorEmptyWait, a.mirrorEmptyPoll = 5*time.Second, 10*time.Millisecond
+	forge.emptyGETs = 2 // the forge shows the first repository as empty for a moment after the push
 
 	// The archive: a light repository with history, two tags and a preserved force push.
 	repo, _ := st.AddRepoMode(ctx, "https://github.com/Zelda-Ret/oot", "github.com/zelda-ret/oot", "github.com/Zelda-Ret/oot", "@u:x", store.ModeLight, "recomps")

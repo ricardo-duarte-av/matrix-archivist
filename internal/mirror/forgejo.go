@@ -175,17 +175,21 @@ func (c *Client) GetRepo(ctx context.Context, owner, name string) (*Repo, error)
 }
 
 // CreateRepo creates an empty repository in an organization (or in the token user's account
-// when owner is that user).
-func (c *Client) CreateRepo(ctx context.Context, owner, name, description string, private bool) error {
+// when owner is that user). defaultBranch may be "".
+func (c *Client) CreateRepo(ctx context.Context, owner, name, description, defaultBranch string, private bool) error {
 	path := "/orgs/" + url.PathEscape(owner) + "/repos"
 	if strings.EqualFold(owner, c.login) {
 		path = "/user/repos"
 	}
-	return c.do(ctx, "POST", path, map[string]any{
+	body := map[string]any{
 		"name":        name,
 		"description": description,
 		"private":     private,
-	}, nil)
+	}
+	if defaultBranch != "" {
+		body["default_branch"] = defaultBranch
+	}
+	return c.do(ctx, "POST", path, body, nil)
 }
 
 // Settings are applied to every mirrored repository.
