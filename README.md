@@ -94,12 +94,42 @@ sources:
       from {{.system}}{{with .oses}}, for {{list .}}{{end}}{{end}}
 ```
 
-- **New entries** are added right away and cloned by the next check cycles, at most `light.max_clones_per_cycle` (50) per cycle, so a list of 600 repositories is archived over a few hours without holding up the others. The first sync adds everything already on the list.
+- **New entries** are added and cloned right away, without waiting for the next check cycle, because a repository can disappear upstream within the hour. At most `light.max_clones_per_cycle` (50) are cloned at once, and later check cycles clone the rest at the same pace, so a list of 600 repositories is archived over a few hours without holding up the others. The first sync adds everything already on the list.
+- **Polling interval:** `interval` (default `15m`, at least `1m`) is how often the list is fetched. A source on the same host or Docker network costs one small HTTP request per sync, so a short interval such as `2m` is cheap. For new entries to arrive within seconds, have the source call the [sync hook](#sync-hook) instead.
 - **Announcements:** each added repository gets a notice in the room, written by the `announce` template (the example gives "📥 Adding https://github.com/o/r, a recomp of **Super Mario 64** from N64, for Windows, Linux and macOS (**#601**, light archive)"). The template sees the entry's JSON fields plus `.repo`, `.id` and `.mode`, and `list` joins a list as "A, B and C". Without a template the notice is "Archiving #601 https://github.com/o/r". When one sync adds more than 10 repositories, as the first sync of an existing list does, they are announced in one grouped notice instead.
 - **Removed entries** are never deleted from the archive. They get the tag `delisted` (and lose it if they come back). If a source suddenly lists less than half of what it added, nothing is marked delisted, in case it is broken.
 - **Removing by hand:** `remove` on a repository a source added stops the source from adding it back. `add` it again to undo that.
 - **Links** to files inside a GitHub repository (`github.com/o/r/tree/…`, `raw.githubusercontent.com/o/r/…`) are reduced to the repository.
 - **Format:** a JSON array of objects (`url_field`, `tag_fields`, `note_fields` choose the fields) or of URL strings, or plain text with one URL per line.
+
+### Sync hook
+
+A source can tell the archivist that its list changed, so the archivist doesn't have to wait for the next `interval`. Give the source a `hook_token`:
+
+```yaml
+sources:
+  - name: recomps
+    url: http://recompbot:8080/api/recomps
+    interval: 2m                    # polling stays on as a fallback
+    hook_token: "<openssl rand -hex 32>"
+```
+
+The HTTP server (`http.enabled`, on by default) then accepts:
+
+```
+POST /hooks/sources/<name>
+Authorization: Bearer <hook_token>
+```
+
+```sh
+curl -X POST -H "Authorization: Bearer $TOKEN" http://archivist:8080/hooks/sources/recomps
+```
+
+- **What it does:** it queues a sync of that source, which is the same as an `interval` sync. The archivist fetches the source's `url`, adds any new entries and starts cloning them immediately. The request body is ignored, so the source must already list the new repository at its `url` before it calls the hook.
+- **Responses:** `202 Accepted` with `{"status":"queued"}` as soon as the sync is queued. The sync and the clones run in the background, so don't wait on them. You get `401` for a missing or wrong token and `404` for a source without `hook_token`. Only `POST` is accepted.
+- **Repeated calls are cheap:** calls that arrive while a sync is queued or running are merged into one more sync after it. A source can call the hook once per new entry, or once after adding a batch.
+- **Failures are harmless:** if a call is lost (the archivist restarting, a network error), the next `interval` sync picks the entry up. A short timeout (a few seconds) and no retry are enough.
+- **Auth:** the hook uses its token, not `http.username`/`http.password`, so a caller doesn't need the file browser's credentials. Use a long random token (at least 16 characters) and keep it out of the source's public output. If the archivist is reachable from the internet, prefer calling it over the internal Docker network.
 
 ## Forge mirror
 
@@ -201,6 +231,7 @@ When `http.enabled` is true, the bot serves a read-only browser for `storage_dir
 | `/download/<path>` | Download one file. Supports resume (HTTP Range). |
 | `/zip/<path>` | Download a folder as a zip. It is built on the fly, so no temp files are written. |
 | `/live/` | Live activity page (see below). |
+| `POST /hooks/sources/<name>` | [Sync hook](#sync-hook) of a source with `hook_token`. It uses that token instead of basic auth. |
 | `/healthz` | Liveness check, used by the Docker `HEALTHCHECK`. |
 
 - **Static files:** the CSS, icons and template are compiled into the binary, so the container needs nothing extra.
@@ -283,7 +314,7 @@ See [`config.example.yaml`](config.example.yaml); every option is commented ther
 | `allow_internal_hosts` | Let forge API calls and release downloads reach internal addresses (default `false`). |
 | `releases.*` | Release archiving, asset downloads, per-asset size cap, prereleases, retention (`keep_last`, `max_repo_size`). |
 | `light.*` | Check interval, clones per cycle and release limits of [light repositories](#light-mode-and-sources). |
-| `sources` | Lists of repositories to archive automatically. |
+| `sources` | Lists of repositories to archive automatically, with an optional [sync hook](#sync-hook) each. |
 | `mirror.*` | Publish the archive to a [Forgejo/Gitea instance](#forge-mirror). |
 | `forges` | API tokens and self-hosted forges. A GitHub token is strongly recommended: without one the API allows 60 requests/hour. |
 | `prune_deleted` | Whether branches and tags deleted upstream are deleted from the archive too. Default `false`: they are kept. Either way they're snapshotted under `refs/archive/` first. |

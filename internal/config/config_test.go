@@ -65,20 +65,31 @@ sources:
 	if l.CheckInterval != 12*time.Hour || l.MaxClonesPerCycle != 50 || !l.Releases.DownloadAssets || l.Releases.KeepLast != 1 || l.Releases.MaxAssetSize != 200<<20 {
 		t.Errorf("light defaults: %+v", l)
 	}
-	if s := cfg.Sources[0]; s.Interval != 30*time.Minute || s.Mode != ModeFull || s.URLField != "url" {
+	if s := cfg.Sources[0]; s.Interval != 30*time.Minute || s.Mode != ModeFull || s.URLField != "url" || s.HookToken != "" {
 		t.Errorf("source: %+v", s)
+	}
+	cfg, err = Parse([]byte(base + `
+sources:
+  - {name: recomps, url: "http://recompbot:8080/api/recomps", hook_token: " 0123456789abcdef "}
+`))
+	if err != nil || cfg.Sources[0].HookToken != "0123456789abcdef" {
+		t.Errorf("hook token: %v %+v", err, cfg.Sources)
 	}
 	_, err = Parse([]byte(base + `
 light: {check_interval: 1s, releases: {keep_last: -1}}
+http: {enabled: false}
 sources:
   - {name: a, url: "file:///etc/passwd"}
   - {name: a, url: "https://x.example.org/list", mode: heavy}
   - {url: "https://x.example.org/list"}
+  - {name: b, url: "https://x.example.org/list", hook_token: short}
+  - {name: c, url: "https://x.example.org/list", hook_token: 0123456789abcdef}
 `))
 	if err == nil {
 		t.Fatal("expected errors")
 	}
-	for _, want := range []string{"light.check_interval", "light.releases.keep_last", "sources[0].url", "used twice", "sources[1].mode", "sources[2].name"} {
+	for _, want := range []string{"light.check_interval", "light.releases.keep_last", "sources[0].url", "used twice", "sources[1].mode", "sources[2].name",
+		"sources[3].hook_token must be at least 16", "sources[4].hook_token needs http.enabled"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("missing %q in %v", want, err)
 		}

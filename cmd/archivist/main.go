@@ -82,6 +82,13 @@ func main() {
 		}
 		srv.Metrics = arch.WriteMetrics
 		srv.Live = arch.Live
+		srv.SourceHooks = map[string]string{}
+		for _, src := range cfg.Sources {
+			if src.HookToken != "" {
+				srv.SourceHooks[src.Name] = src.HookToken
+			}
+		}
+		srv.TriggerSource = arch.TriggerSource
 		go func() {
 			if err := srv.Run(ctx); err != nil {
 				log.Error().Err(err).Msg("HTTP server stopped")

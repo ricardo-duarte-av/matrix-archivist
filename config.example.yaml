@@ -105,14 +105,19 @@ light:
     max_asset_size: 200MB   # larger files are skipped (0 = unlimited)
     max_repo_size: ""       # optional cap on git data + release files
 
-# Lists of repositories to archive automatically. Each is fetched every `interval`; new entries
-# are added (cloned by the next check cycles) and entries that disappear are tagged `delisted`,
+# Lists of repositories to archive automatically. Each is fetched every `interval` (or when its
+# sync hook is called); new entries are added and cloned right away (at most
+# light.max_clones_per_cycle at once) and entries that disappear are tagged `delisted`,
 # never deleted. A repository removed with `remove` is not added back (until `add`ed again).
 # The response can be a JSON array of objects or of URL strings, or text with one URL per line.
 sources: []
 #  - name: recomps                               # one word; shown in messages and `info`
 #    url: http://recompbot:8080/api/recomps      # recomps-ai-bot's JSON list
-#    interval: 15m
+#    interval: 15m                               # >= 1m; cheap for a source on the same network
+#    # Enables POST /hooks/sources/<name> (with "Authorization: Bearer <token>") on the HTTP
+#    # server: the source calls it after adding a repository, to have it synced and cloned
+#    # within seconds. At least 16 characters, e.g. `openssl rand -hex 32`. Needs http.enabled.
+#    hook_token: ""
 #    mode: light                                 # light (default) or full
 #    tags: [recomps]                             # added to every repository from this source
 #    url_field: url                              # JSON field with the repository URL

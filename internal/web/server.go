@@ -48,6 +48,11 @@ type Server struct {
 	// Live is the archiver's activity hub; the live page is served when set and http.live is on.
 	Live *live.Hub
 
+	// SourceHooks maps source names to their hook tokens; TriggerSource makes one sync now.
+	// POST /hooks/sources/{name} is served when both are set.
+	SourceHooks   map[string]string
+	TriggerSource func(name string) bool
+
 	streams atomic.Int32 // open /live/events connections
 }
 
@@ -94,7 +99,41 @@ func (s *Server) Handler() http.Handler {
 	if s.cfg.Username != "" {
 		h = s.basicAuth(h)
 	}
+	if len(s.SourceHooks) > 0 && s.TriggerSource != nil {
+		// Hooks carry their own token, so they are outside basic auth.
+		top := http.NewServeMux()
+		top.HandleFunc("POST /hooks/sources/{name}", s.handleSourceHook)
+		top.Handle("/", h)
+		h = top
+	}
 	return securityHeaders(h)
+}
+
+// handleSourceHook makes a source sync now. It answers 202 as soon as the sync is queued; the
+// sync itself (and the clones it starts) run in the background.
+func (s *Server) handleSourceHook(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	want, ok := s.SourceHooks[name]
+	if !ok || want == "" {
+		http.Error(w, "no hook for this source", http.StatusNotFound)
+		return
+	}
+	got, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if !ok || subtle.ConstantTimeCompare([]byte(strings.TrimSpace(got)), []byte(want)) != 1 {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="archivist"`)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	// The body is ignored: the sync fetches the source's list itself.
+	io.Copy(io.Discard, http.MaxBytesReader(w, r.Body, 64<<10))
+	if !s.TriggerSource(name) {
+		http.Error(w, "no such source", http.StatusNotFound)
+		return
+	}
+	s.log.Debug().Str("source", name).Str("remote", r.RemoteAddr).Msg("Source hook called")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	io.WriteString(w, `{"status":"queued"}`+"\n")
 }
 
 // Run serves until ctx is cancelled.

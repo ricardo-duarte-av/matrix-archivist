@@ -403,3 +403,66 @@ func TestMirrorReadme(t *testing.T) {
 		t.Fatalf("readme: ok=%v %+v", ok, info)
 	}
 }
+
+// A triggered source sync runs without waiting for the interval, and the repositories it adds
+// are checked (cloned) right away, at most light.max_clones_per_cycle of them.
+func TestTriggerSourceClonesNow(t *testing.T) {
+	var mu sync.Mutex
+	fetches := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		fetches++
+		mu.Unlock()
+		// git.invalid never resolves, so each clone fails fast and is recorded as a failure.
+		w.Write([]byte("https://git.invalid/o/one\nhttps://git.invalid/o/two\n"))
+	}))
+	defer srv.Close()
+
+	st := testStore(t)
+	cfg, err := config.Parse([]byte(fmt.Sprintf(testMatrix+`
+storage_dir: %s
+light: {max_clones_per_cycle: 1}
+sources:
+  - {name: recomps, url: %q, interval: 1h}
+`, filepath.Join(t.TempDir(), "repos"), srv.URL)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := New(cfg, st, zerolog.Nop())
+	if a.TriggerSource("nope") {
+		t.Error("unknown source triggered")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go a.runSource(ctx, cfg.Sources[0])
+	if !a.TriggerSource("recomps") || !a.TriggerSource("recomps") {
+		t.Fatal("trigger refused")
+	}
+
+	checked := func() (n int) {
+		repos, _ := st.Repos(ctx)
+		for _, r := range repos {
+			if r.FailCount > 0 {
+				n++
+			}
+		}
+		return n
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for checked() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("added repository wasn't checked after the triggered sync")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	time.Sleep(300 * time.Millisecond)
+	repos, _ := st.Repos(ctx)
+	if len(repos) != 2 || checked() != 1 {
+		t.Errorf("%d repos, %d checked; want 2 added and 1 cloned now (cap)", len(repos), checked())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if fetches < 1 || fetches > 2 {
+		t.Errorf("fetches: %d", fetches)
+	}
+}

@@ -111,17 +111,52 @@ func (r SyncResult) Empty() bool {
 	return len(r.Added) == 0 && len(r.Delisted) == 0 && len(r.Relisted) == 0
 }
 
-// runSource syncs one source every interval until ctx is cancelled. The first sync is done
-// by Run, before the first check cycle.
+// runSource syncs one source every interval, or sooner when triggered (see TriggerSource),
+// until ctx is cancelled. The first sync is done by Run, before the first check cycle.
 func (a *Archiver) runSource(ctx context.Context, src config.Source) {
+	kick := a.sourceKicks[src.Name]
 	for {
+		timer := time.NewTimer(src.Interval)
 		select {
-		case <-time.After(src.Interval):
+		case <-timer.C:
+		case <-kick:
+			timer.Stop()
+			a.log.Info().Str("source", src.Name).Msg("Source sync triggered")
 		case <-ctx.Done():
+			timer.Stop()
 			return
 		}
 		a.syncAndReport(ctx, src)
 	}
+}
+
+// TriggerSource makes the named source sync as soon as possible, instead of at its next
+// interval. Triggers that arrive while a sync is pending or running are merged into one more
+// sync. Returns false if there is no such source.
+func (a *Archiver) TriggerSource(name string) bool {
+	kick, ok := a.sourceKicks[name]
+	if !ok {
+		return false
+	}
+	select {
+	case kick <- struct{}{}:
+	default: // one is pending already
+	}
+	return true
+}
+
+// cloneAdded starts archiving repositories a source sync just added, instead of leaving them to
+// the next check cycle: a repository can disappear upstream within the hour. At most
+// light.max_clones_per_cycle are cloned now; check cycles pick up the rest as usual.
+func (a *Archiver) cloneAdded(ctx context.Context, src config.Source, added []*store.Repo) {
+	if max := a.cfg.Light.MaxClonesPerCycle; max > 0 && len(added) > max {
+		added = added[:max]
+	}
+	ids := make([]int64, len(added))
+	for i, r := range added {
+		ids[i] = r.ID
+	}
+	a.checkMany(ctx, ids, false, "Source "+src.Name)
 }
 
 // syncAndReport syncs a source and reports the outcome in the log, the live activity feed
@@ -156,10 +191,10 @@ func (a *Archiver) syncAndReport(ctx context.Context, src config.Source) {
 
 	if n := len(res.Added); n > 0 && n <= announceMax {
 		for _, r := range res.Added {
-			a.Live.Event(r.ID, r.URL, "info", fmt.Sprintf("Added by source %s (%s mode); cloned in the next check cycle", src.Name, r.Mode))
+			a.Live.Event(r.ID, r.URL, "info", fmt.Sprintf("Added by source %s (%s mode); cloning now", src.Name, r.Mode))
 		}
 	} else if n > 0 {
-		a.Live.Event(0, "", "info", fmt.Sprintf("Source %s: %d new repositories queued (%s mode), cloned up to %d per check cycle",
+		a.Live.Event(0, "", "info", fmt.Sprintf("Source %s: %d new repositories queued (%s mode), cloned up to %d at a time",
 			src.Name, n, src.Mode, a.cfg.Light.MaxClonesPerCycle))
 	}
 	if n := len(res.Delisted); n > 0 {
@@ -170,6 +205,9 @@ func (a *Archiver) syncAndReport(ctx context.Context, src config.Source) {
 	}
 	for _, msg := range SyncMessages(src, res) {
 		a.Notify(ctx, msg)
+	}
+	if len(res.Added) > 0 {
+		go a.cloneAdded(ctx, src, res.Added)
 	}
 }
 
@@ -204,8 +242,8 @@ func (a *Archiver) fetchSource(ctx context.Context, src config.Source) ([]byte, 
 
 // SyncSource fetches a source and adds the repositories it lists that aren't tracked yet
 // (except ones removed by hand). Repositories it added earlier that it no longer lists are
-// tagged "delisted" but kept; the tag goes away if they come back. They are cloned by the
-// check cycle.
+// tagged "delisted" but kept; the tag goes away if they come back. syncAndReport starts
+// cloning the new ones right away (see cloneAdded).
 func (a *Archiver) SyncSource(ctx context.Context, src config.Source) (SyncResult, error) {
 	data, err := a.fetchSource(ctx, src)
 	if err != nil {

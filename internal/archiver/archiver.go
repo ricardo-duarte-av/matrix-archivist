@@ -45,6 +45,8 @@ type Archiver struct {
 
 	// sourceInvalid remembers each source's invalid URLs, to log them only when they change.
 	sourceInvalid map[string]string
+	// sourceKicks holds one channel per source; a send makes it sync now (see TriggerSource).
+	sourceKicks map[string]chan struct{}
 
 	// Live is what the archiver is doing right now, for the live activity page.
 	Live *live.Hub
@@ -78,9 +80,13 @@ func New(cfg *config.Config, st *store.Store, log zerolog.Logger) *Archiver {
 		log:           log,
 		locks:         map[int64]*sync.Mutex{},
 		sourceInvalid: map[string]string{},
+		sourceKicks:   map[string]chan struct{}{},
 		Notify:        func(context.Context, string) {},
 		Alert:         func(context.Context, string) {},
 		Live:          hub,
+	}
+	for _, src := range cfg.Sources {
+		a.sourceKicks[src.Name] = make(chan struct{}, 1)
 	}
 	if cfg.Mirror.Enabled {
 		a.mirror = mirror.NewClient(cfg.Mirror.URL, cfg.Mirror.Token)
@@ -732,7 +738,7 @@ func (a *Archiver) RunCycle(ctx context.Context, force bool) (results []Result, 
 		what = fmt.Sprintf("%d of %d repositories; the other light ones aren't due yet", len(ids), len(repos))
 	}
 	a.Live.Event(0, "", "info", "Check cycle started ("+what+")")
-	results = a.checkMany(ctx, ids, true)
+	results = a.checkMany(ctx, ids, true, "")
 	took := time.Since(start)
 	a.Live.CycleEnd()
 	changed, failed := 0, 0
@@ -753,11 +759,12 @@ func (a *Archiver) RunCycle(ctx context.Context, force bool) (results []Result, 
 
 // CheckMany checks the given repositories with bounded concurrency.
 func (a *Archiver) CheckMany(ctx context.Context, ids []int64) (results []Result) {
-	return a.checkMany(ctx, ids, false)
+	return a.checkMany(ctx, ids, false, "")
 }
 
 // checkMany runs the checks; cycle checks report on the hub's worker slots and progress.
-func (a *Archiver) checkMany(ctx context.Context, ids []int64, cycle bool) (results []Result) {
+// Other checks show on the live page under label (default "Manual check").
+func (a *Archiver) checkMany(ctx context.Context, ids []int64, cycle bool, label string) (results []Result) {
 	jobs := make(chan int64)
 	out := make(chan Result)
 	var wg sync.WaitGroup
@@ -781,7 +788,11 @@ func (a *Archiver) checkMany(ctx context.Context, ids []int64, cycle bool) (resu
 					}
 					continue
 				}
-				res := a.check(ctx, id)
+				jctx := ctx
+				if !cycle && label != "" {
+					jctx = live.WithSlot(ctx, a.Live.Temp(label))
+				}
+				res := a.check(jctx, id)
 				m.Unlock()
 				if cycle {
 					a.Live.CycleTick()

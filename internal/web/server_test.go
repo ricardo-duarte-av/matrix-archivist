@@ -296,3 +296,55 @@ func TestLiveStream(t *testing.T) {
 		t.Errorf("events resent or progress missing: %+v", snap)
 	}
 }
+
+func TestSourceHook(t *testing.T) {
+	s, err := New(config.HTTP{Enabled: true, MaxConcurrentZips: 1, Username: "u", Password: "p"}, t.TempDir(), zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const token = "0123456789abcdef0123"
+	var triggered []string
+	s.SourceHooks = map[string]string{"recomps": token}
+	s.TriggerSource = func(name string) bool { triggered = append(triggered, name); return true }
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	post := func(path, auth string) int {
+		t.Helper()
+		req, _ := http.NewRequest("POST", srv.URL+path, strings.NewReader(`{"url":"https://github.com/o/r"}`))
+		if auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	// The hook has its own token and is outside basic auth.
+	for _, c := range []struct {
+		path, auth string
+		want       int
+	}{
+		{"/hooks/sources/recomps", "", http.StatusUnauthorized},
+		{"/hooks/sources/recomps", "Bearer wrong", http.StatusUnauthorized},
+		{"/hooks/sources/recomps", token, http.StatusUnauthorized},
+		{"/hooks/sources/other", "Bearer " + token, http.StatusNotFound},
+		{"/hooks/sources/recomps", "Bearer " + token, http.StatusAccepted},
+	} {
+		if got := post(c.path, c.auth); got != c.want {
+			t.Errorf("POST %s %q: %d, want %d", c.path, c.auth, got, c.want)
+		}
+	}
+	if strings.Join(triggered, ",") != "recomps" {
+		t.Errorf("triggered: %v", triggered)
+	}
+	// GET isn't a hook; it falls through to the protected routes.
+	if resp, _ := get(t, srv.URL+"/hooks/sources/recomps"); resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("GET hook: %d", resp.StatusCode)
+	}
+	if resp, _ := get(t, srv.URL+"/browse/"); resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("browse still protected: %d", resp.StatusCode)
+	}
+}

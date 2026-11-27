@@ -100,6 +100,9 @@ type Source struct {
 	// sees the entry's JSON fields plus .repo (the repository URL), .id and .mode, and has
 	// a "list" function ("A, B and C"). Empty: a plain "Archiving <url>" notice.
 	Announce string `yaml:"announce"`
+	// HookToken enables POST /hooks/sources/<name> on the HTTP server, which makes the source
+	// sync right away; callers send it as "Authorization: Bearer <token>". Empty: no hook.
+	HookToken string `yaml:"hook_token"`
 
 	Interval         time.Duration      `yaml:"-"`
 	AnnounceTemplate *template.Template `yaml:"-"`
@@ -465,6 +468,13 @@ func (c *Config) validate() error {
 		}
 		if s.URLField == "" {
 			s.URLField = "url"
+		}
+		s.HookToken = strings.TrimSpace(s.HookToken)
+		if s.HookToken != "" && len(s.HookToken) < 16 {
+			add("sources[%d].hook_token must be at least 16 characters (e.g. openssl rand -hex 32)", i)
+		}
+		if s.HookToken != "" && !c.HTTP.Enabled {
+			add("sources[%d].hook_token needs http.enabled: the hook is served by the HTTP server", i)
 		}
 		if strings.TrimSpace(s.Announce) != "" {
 			if s.AnnounceTemplate, err = template.New(s.Name).Funcs(TemplateFuncs).Parse(strings.TrimSpace(s.Announce)); err != nil {
