@@ -117,16 +117,18 @@ func (a *Archiver) runSource(ctx context.Context, src config.Source) {
 	kick := a.sourceKicks[src.Name]
 	for {
 		timer := time.NewTimer(src.Interval)
+		trigger := TriggerInterval
 		select {
 		case <-timer.C:
 		case <-kick:
 			timer.Stop()
-			a.log.Info().Str("source", src.Name).Msg("Source sync triggered")
+			trigger = TriggerHook
+			a.log.Info().Str("source", src.Name).Msg("Source sync triggered by its hook")
 		case <-ctx.Done():
 			timer.Stop()
 			return
 		}
-		a.syncAndReport(ctx, src)
+		a.syncAndReport(ctx, src, trigger)
 	}
 }
 
@@ -159,10 +161,17 @@ func (a *Archiver) cloneAdded(ctx context.Context, src config.Source, added []*s
 	a.checkMany(ctx, ids, false, "Source "+src.Name)
 }
 
+// What started a source sync, as shown in the log and the live activity feed.
+const (
+	TriggerStartup  = "startup"
+	TriggerInterval = "interval"
+	TriggerHook     = "hook"
+)
+
 // syncAndReport syncs a source and reports the outcome in the log, the live activity feed
 // and the room.
-func (a *Archiver) syncAndReport(ctx context.Context, src config.Source) {
-	log := a.log.With().Str("source", src.Name).Logger()
+func (a *Archiver) syncAndReport(ctx context.Context, src config.Source, trigger string) {
+	log := a.log.With().Str("source", src.Name).Str("trigger", trigger).Logger()
 	res, err := a.SyncSource(ctx, src)
 	if err != nil {
 		if ctx.Err() == nil {
@@ -172,7 +181,8 @@ func (a *Archiver) syncAndReport(ctx context.Context, src config.Source) {
 		return
 	}
 	ev := log.Debug()
-	if !res.Empty() {
+	// A hook sync is always logged, so a caller can see it happened even when it added nothing.
+	if !res.Empty() || trigger == TriggerHook {
 		ev = log.Info()
 	}
 	ev.Int("listed", res.Listed).Int("added", len(res.Added)).Int("delisted", len(res.Delisted)).
@@ -189,13 +199,20 @@ func (a *Archiver) syncAndReport(ctx context.Context, src config.Source) {
 		}
 	}
 
+	via := ""
+	if trigger == TriggerHook {
+		via = " via its sync hook"
+		for _, r := range res.Added {
+			log.Info().Int64("repo_id", r.ID).Str("url", r.URL).Msg("Adding repository via sync hook; cloning now")
+		}
+	}
 	if n := len(res.Added); n > 0 && n <= announceMax {
 		for _, r := range res.Added {
-			a.Live.Event(r.ID, r.URL, "info", fmt.Sprintf("Added by source %s (%s mode); cloning now", src.Name, r.Mode))
+			a.Live.Event(r.ID, r.URL, "info", fmt.Sprintf("Added by source %s%s (%s mode); cloning now", src.Name, via, r.Mode))
 		}
 	} else if n > 0 {
-		a.Live.Event(0, "", "info", fmt.Sprintf("Source %s: %d new repositories queued (%s mode), cloned up to %d at a time",
-			src.Name, n, src.Mode, a.cfg.Light.MaxClonesPerCycle))
+		a.Live.Event(0, "", "info", fmt.Sprintf("Source %s%s: %d new repositories queued (%s mode), cloned up to %d at a time",
+			src.Name, via, n, src.Mode, a.cfg.Light.MaxClonesPerCycle))
 	}
 	if n := len(res.Delisted); n > 0 {
 		a.Live.Event(0, "", "info", fmt.Sprintf("Source %s no longer lists %d repositories; tagged %s", src.Name, n, store.TagDelisted))

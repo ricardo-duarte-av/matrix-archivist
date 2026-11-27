@@ -833,7 +833,7 @@ func (a *Archiver) Run(ctx context.Context) {
 	}
 	// Sync the sources first, so what they add is cloned in the first cycle.
 	for _, src := range a.cfg.Sources {
-		a.syncAndReport(ctx, src)
+		a.syncAndReport(ctx, src, TriggerStartup)
 		go a.runSource(ctx, src)
 	}
 	ticker := time.NewTicker(a.cfg.CheckInterval)

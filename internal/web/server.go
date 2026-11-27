@@ -130,7 +130,7 @@ func (s *Server) handleSourceHook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no such source", http.StatusNotFound)
 		return
 	}
-	s.log.Debug().Str("source", name).Str("remote", r.RemoteAddr).Msg("Source hook called")
+	s.log.Info().Str("source", name).Str("remote", r.RemoteAddr).Msg("Source sync hook called; sync queued")
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	io.WriteString(w, `{"status":"queued"}`+"\n")
